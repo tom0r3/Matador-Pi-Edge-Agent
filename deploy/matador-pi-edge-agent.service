@@ -1,0 +1,20 @@
+[Unit]
+Description=Matador Pi Edge Agent
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=matador-edge
+Group=matador-edge
+WorkingDirectory=/opt/gofree-collector
+EnvironmentFile=-/etc/matador-pi-edge-agent.env
+ExecStart=/opt/gofree-collector/.venv/bin/python -m edge_agent.pi_edge_agent
+Restart=always
+RestartSec=5
+StateDirectory=matador-pi-edge-agent
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

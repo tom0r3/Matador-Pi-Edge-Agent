@@ -1,0 +1,827 @@
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import logging
+import os
+import secrets
+import shutil
+import socket
+import sqlite3
+import time
+import urllib.error
+import urllib.request
+import uuid
+from contextlib import suppress
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import websockets
+
+
+APP_NAME = "Matador Pi Edge Agent"
+APP_VERSION = "3.5.0"
+DEFAULT_SERVER = "https://matador.torodatasystems.eu"
+GOFREE_DISCOVERY_GROUP = "239.2.1.1"
+GOFREE_DISCOVERY_PORTS = (2052, 2050)
+GOFREE_DATA_INFO_REFRESH_SECONDS = 30.0
+GOFREE_DATA_SILENCE_RECONNECT_SECONDS = 60.0
+CONFIG_POLL_SECONDS = 10.0
+CLAIM_POLL_SECONDS = 15.0
+IDLE_SLEEP_SECONDS = 1.0
+GOFREE_COMPASS_TRUE_MAG_SETTING_ID = 21
+GOFREE_DATA_INFO_METRIC_NAMES = {
+    "COG",
+    "HEADING",
+    "TWD",
+    "START_LINE_BIAS",
+    "START_LINE_BEARING",
+    "MAG_VARIATION",
+}
+GOFREE_COMPASS_TRUE_MAG_METRIC_NAMES = {"HEADING", "TWD", "START_LINE_BEARING"}
+
+LOGGER = logging.getLogger("matador_pi_edge_agent")
+
+
+@dataclass(frozen=True)
+class DiscoveredGoFreeDevice:
+    host: str
+    port: int
+    name: str
+    model: str
+    serial_number: str
+    source: str
+
+    @property
+    def label(self) -> str:
+        title = " - ".join(part for part in (self.name, self.model, self.serial_number) if part)
+        prefix = f"{title} - " if title else ""
+        return f"{prefix}{self.host}:{self.port} ({self.source})"
+
+
+class PayloadSpool:
+    def __init__(self, path: Path, max_rows: int) -> None:
+        self.path = path
+        self.max_rows = max_rows
+        self._ensure_schema()
+
+    def _connect(self) -> sqlite3.Connection:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(self.path)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        return conn
+
+    def _ensure_schema(self) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS outbound_payloads (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at REAL NOT NULL,
+                    payload_json TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS outbound_payloads_created_idx ON outbound_payloads(created_at)")
+
+    def enqueue(self, payload: dict[str, Any]) -> None:
+        encoded = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO outbound_payloads (created_at, payload_json) VALUES (?, ?)",
+                (time.time(), encoded),
+            )
+            if self.max_rows > 0:
+                conn.execute(
+                    """
+                    DELETE FROM outbound_payloads
+                    WHERE id IN (
+                        SELECT id
+                        FROM outbound_payloads
+                        ORDER BY id ASC
+                        LIMIT max((SELECT count(*) FROM outbound_payloads) - ?, 0)
+                    )
+                    """,
+                    (self.max_rows,),
+                )
+
+    def peek_oldest(self) -> tuple[int, dict[str, Any]] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT id, payload_json FROM outbound_payloads ORDER BY id ASC LIMIT 1"
+            ).fetchone()
+        if row is None:
+            return None
+        return int(row[0]), json.loads(str(row[1]))
+
+    def ack(self, payload_id: int) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM outbound_payloads WHERE id = ?", (payload_id,))
+
+    def stats(self) -> dict[str, Any]:
+        with self._connect() as conn:
+            row = conn.execute("SELECT count(*), min(created_at), max(created_at) FROM outbound_payloads").fetchone()
+        count = int(row[0] or 0)
+        return {
+            "pending_payloads": count,
+            "oldest_payload_age_seconds": max(0.0, time.time() - float(row[1])) if row[1] else None,
+            "newest_payload_age_seconds": max(0.0, time.time() - float(row[2])) if row[2] else None,
+            "spool_bytes": self.path.stat().st_size if self.path.exists() else 0,
+            "spool_max_payloads": self.max_rows,
+        }
+
+
+def default_state_dir() -> Path:
+    if os.name == "nt":
+        return Path(os.environ.get("APPDATA", Path.home())) / "MatadorPiEdgeAgent"
+    return Path(os.environ.get("MATADOR_PI_EDGE_STATE_DIR", "/var/lib/matador-pi-edge-agent"))
+
+
+def load_json(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        LOGGER.warning("Ignoring unreadable state file at %s", path)
+        return {}
+
+
+def save_json(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+        temporary.replace(path)
+        with suppress(OSError):
+            path.chmod(0o600)
+    finally:
+        with suppress(OSError):
+            temporary.unlink()
+
+
+def stable_claim_code(device_uid: str) -> str:
+    compact = "".join(ch for ch in device_uid.upper() if ch.isalnum())
+    return "-".join((compact + "00000000")[idx : idx + 4] for idx in (0, 4))
+
+
+def int_or_none(value: Any) -> int | None:
+    try:
+        if value is None:
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def hostname() -> str:
+    try:
+        return socket.gethostname()
+    except OSError:
+        return "matador-pi-edge-agent"
+
+
+def disk_stats(path: Path) -> dict[str, Any]:
+    try:
+        usage = shutil.disk_usage(path)
+        return {
+            "path": str(path),
+            "total_bytes": usage.total,
+            "used_bytes": usage.used,
+            "free_bytes": usage.free,
+            "used_percent": round((usage.used / usage.total) * 100, 2) if usage.total else None,
+        }
+    except OSError as exc:
+        return {"path": str(path), "error": str(exc)}
+
+
+def load_average() -> dict[str, Any]:
+    try:
+        one, five, fifteen = os.getloadavg()
+        return {"load_1m": one, "load_5m": five, "load_15m": fifteen}
+    except (AttributeError, OSError):
+        return {}
+
+
+def bearer_headers(token: str | None = None) -> dict[str, str]:
+    headers = {"Accept": "application/json", "Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def request_json(server_url: str, path: str, payload: dict[str, Any] | None = None, token: str | None = None) -> dict[str, Any]:
+    url = f"{server_url.rstrip('/')}{path}"
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    request = urllib.request.Request(
+        url,
+        data=data,
+        headers=bearer_headers(token),
+        method="POST" if payload is not None else "GET",
+    )
+    with urllib.request.urlopen(request, timeout=15) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def device_from_discovery_payload(payload: str, sender_host: str, source: str) -> DiscoveredGoFreeDevice | None:
+    text = payload.strip().strip("\x00")
+    if not text:
+        return None
+    try:
+        data = json.loads(text)
+        services = data.get("Services") or []
+        websocket_service = next(
+            (
+                service
+                for service in services
+                if isinstance(service, dict)
+                and str(service.get("Service") or "").lower() == "navico-nav-ws"
+            ),
+            None,
+        )
+        if websocket_service or data.get("IP"):
+            return DiscoveredGoFreeDevice(
+                host=str(data.get("IP") or sender_host).strip(),
+                port=int(websocket_service.get("Port") or 2053) if websocket_service else 2053,
+                name=str(data.get("Name") or "").strip(),
+                model=str(data.get("Model") or "").strip(),
+                serial_number=str(data.get("SerialNumber") or "").strip(),
+                source=source,
+            )
+    except (json.JSONDecodeError, TypeError, ValueError):
+        pass
+
+    parts = [part.strip() for part in text.split(",")]
+    if len(parts) >= 4 and parts[2]:
+        return DiscoveredGoFreeDevice(
+            host=parts[2],
+            port=int_or_none(parts[3]) or 2053,
+            name=parts[0],
+            model="",
+            serial_number="",
+            source=source,
+        )
+    return None
+
+
+def unique_devices(devices: list[DiscoveredGoFreeDevice]) -> list[DiscoveredGoFreeDevice]:
+    seen: set[tuple[str, int]] = set()
+    unique: list[DiscoveredGoFreeDevice] = []
+    for device in devices:
+        key = (device.host, device.port)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(device)
+    return sorted(unique, key=lambda item: (item.host, item.port, item.name))
+
+
+def discover_gofree_devices(timeout_seconds: float = 8.0) -> list[DiscoveredGoFreeDevice]:
+    devices: list[DiscoveredGoFreeDevice] = []
+    deadline = time.monotonic() + timeout_seconds
+    for port in GOFREE_DISCOVERY_PORTS:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.settimeout(max(0.2, remaining))
+            sock.bind(("", port))
+            membership = socket.inet_aton(GOFREE_DISCOVERY_GROUP) + socket.inet_aton("0.0.0.0")
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, membership)
+            while time.monotonic() < deadline:
+                try:
+                    data, address = sock.recvfrom(4096)
+                except socket.timeout:
+                    break
+                device = device_from_discovery_payload(data.decode("ascii", errors="ignore"), address[0], f"UDP {port}")
+                if device:
+                    devices.append(device)
+        except OSError as exc:
+            LOGGER.debug("GoFree discovery on UDP %s failed: %s", port, exc)
+        finally:
+            sock.close()
+    return unique_devices(devices)
+
+
+class PiEdgeAgent:
+    def __init__(
+        self,
+        *,
+        server_url: str,
+        state_dir: Path,
+        enrollment_code: str,
+        processor_host: str,
+        discovery_timeout: float,
+        spool_max_payloads: int,
+        data_silence_reconnect_seconds: float,
+    ) -> None:
+        self.server_url = server_url.rstrip("/")
+        self.state_dir = state_dir
+        self.state_path = state_dir / "state.json"
+        self.spool = PayloadSpool(state_dir / "outbound-spool.sqlite3", spool_max_payloads)
+        self.state = load_json(self.state_path)
+        self.enrollment_code = enrollment_code.strip().upper()
+        self.processor_host_override = processor_host.strip()
+        self.discovery_timeout = discovery_timeout
+        self.data_silence_reconnect_seconds = max(10.0, data_silence_reconnect_seconds)
+        self.data_info_by_metric_id: dict[int, dict[str, Any]] = {}
+        self.setting_by_id: dict[int, dict[str, Any]] = {}
+        self.stop_event = asyncio.Event()
+        self.current_config: dict[str, Any] = {}
+        self.processor_enabled = bool(self.state.get("processor_enabled", True))
+        self.streaming_enabled = bool(self.state.get("streaming_enabled", True))
+        self.last_remote_command_at = str(self.state.get("last_remote_command_at") or "")
+
+    @property
+    def device_token(self) -> str:
+        return str(self.state.get("device_token") or "")
+
+    def save_state(self) -> None:
+        save_json(self.state_path, self.state)
+
+    def claim_identity(self) -> tuple[str, str, str]:
+        device_uid = str(self.state.get("device_uid") or "").strip()
+        if not device_uid:
+            device_uid = str(uuid.uuid4())
+            self.state["device_uid"] = device_uid
+        claim_token = str(self.state.get("claim_device_token") or "").strip()
+        if not claim_token:
+            claim_token = secrets.token_urlsafe(32)
+            self.state["claim_device_token"] = claim_token
+        claim_code = str(self.state.get("claim_code") or "").strip()
+        if not claim_code:
+            claim_code = stable_claim_code(device_uid)
+            self.state["claim_code"] = claim_code
+        self.save_state()
+        return device_uid, claim_token, claim_code
+
+    def request_claim(self) -> dict[str, Any]:
+        device_uid, claim_token, claim_code = self.claim_identity()
+        LOGGER.info("Requesting Matador admin claim approval with claim code %s", claim_code)
+        local_host = str(self.state.get("last_processor_host") or self.processor_host_override or "").strip()
+        if not local_host:
+            with suppress(Exception):
+                devices = discover_gofree_devices(min(self.discovery_timeout, 3.0))
+                if devices:
+                    self.state["last_discovered_device"] = devices[0].__dict__
+                    self.state["last_processor_host"] = devices[0].host
+                    self.save_state()
+                    local_host = devices[0].host
+        return request_json(
+            self.server_url,
+            "/edge/pi-claim",
+            {
+                "device_uid": device_uid,
+                "device_token": claim_token,
+                "claim_code": claim_code,
+                "device_label": APP_NAME,
+                "app_version": APP_VERSION,
+                "client_hostname": hostname(),
+                "local_processor_host": local_host or None,
+                "pi_health": self.health_payload(),
+            },
+        )
+
+    def claim_until_approved(self) -> None:
+        while not self.device_token:
+            response = self.request_claim()
+            if response.get("status") == "approved":
+                _, claim_token, _ = self.claim_identity()
+                self.state["device_token"] = claim_token
+                self.state["config"] = response.get("config") or {}
+                self.state["enrolled_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                self.save_state()
+                LOGGER.info("Pi Edge Agent claim approved by Matador")
+                return
+            if response.get("status") == "rejected":
+                raise RuntimeError("Pi Edge Agent claim was rejected by Matador admin")
+            claim_code = response.get("claim_code") or self.state.get("claim_code") or ""
+            LOGGER.info("Waiting for Matador admin approval. Claim code: %s", claim_code)
+            time.sleep(CLAIM_POLL_SECONDS)
+
+    def enroll_if_needed(self) -> None:
+        if self.device_token:
+            return
+        if not self.enrollment_code:
+            self.claim_until_approved()
+            return
+        LOGGER.info("Enrolling Pi Edge Agent with Matador")
+        response = request_json(
+            self.server_url,
+            "/edge/enroll",
+            {
+                "enrollment_code": self.enrollment_code,
+                "device_label": APP_NAME,
+                "app_version": APP_VERSION,
+                "client_hostname": hostname(),
+            },
+        )
+        token = str(response.get("device_token") or "")
+        if not token:
+            raise RuntimeError("Matador enrollment response did not include a device token")
+        self.state["device_token"] = token
+        self.state["config"] = response.get("config") or {}
+        self.state["enrolled_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        self.save_state()
+        LOGGER.info("Pi Edge Agent enrolled")
+
+    def fetch_config(self) -> dict[str, Any]:
+        self.enroll_if_needed()
+        try:
+            response = request_json(self.server_url, "/edge/config", token=self.device_token)
+        except urllib.error.HTTPError as exc:
+            if exc.code in (401, 403) and not self.enrollment_code:
+                LOGGER.warning("Stored Matador token was rejected; clearing token and entering Pi claim mode")
+                self.state.pop("device_token", None)
+                self.state.pop("config", None)
+                self.save_state()
+                self.claim_until_approved()
+                response = request_json(self.server_url, "/edge/config", token=self.device_token)
+            else:
+                raise
+        self.state["config"] = response
+        self.state["last_config_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        self.current_config = response
+        self.handle_remote_command(response.get("command") or {})
+        self.save_state()
+        return response
+
+    def acknowledge_remote_command(self, requested_at: str | None) -> bool:
+        if not requested_at:
+            return True
+        try:
+            request_json(self.server_url, "/edge/command-ack", {"requested_at": requested_at}, token=self.device_token)
+            return True
+        except Exception as exc:
+            LOGGER.warning("Failed to acknowledge remote command: %s", exc)
+            return False
+
+    def handle_remote_command(self, command: dict[str, Any]) -> None:
+        action = str(command.get("action") or "").strip()
+        requested_at = str(command.get("requested_at") or "").strip()
+        if not action or not requested_at or requested_at == self.last_remote_command_at:
+            return
+        LOGGER.info("Applying remote command %s requested at %s", action, requested_at)
+        if action == "connect_processor":
+            self.processor_enabled = True
+        elif action == "start_streaming":
+            self.processor_enabled = True
+            self.streaming_enabled = True
+        elif action == "stop_streaming":
+            self.streaming_enabled = False
+        else:
+            LOGGER.warning("Ignoring unknown remote command: %s", action)
+        self.state["processor_enabled"] = self.processor_enabled
+        self.state["streaming_enabled"] = self.streaming_enabled
+        if self.acknowledge_remote_command(requested_at):
+            self.last_remote_command_at = requested_at
+            self.state["last_remote_command_at"] = requested_at
+
+    def health_payload(self) -> dict[str, Any]:
+        return {
+            "agent": {
+                "kind": "pi_edge_agent",
+                "name": APP_NAME,
+                "version": APP_VERSION,
+                "hostname": hostname(),
+            },
+            "controls": {
+                "processor_enabled": self.processor_enabled,
+                "streaming_enabled": self.streaming_enabled,
+                "last_remote_command_at": self.last_remote_command_at or None,
+            },
+            "storage": {
+                "state_dir": disk_stats(self.state_dir),
+                "spool": self.spool.stats(),
+            },
+            "system": load_average(),
+            "last_discovered_device": self.state.get("last_discovered_device") or None,
+            "last_processor_host": self.state.get("last_processor_host") or None,
+        }
+
+    def config(self) -> dict[str, Any]:
+        return self.current_config or self.state.get("config") or {}
+
+    def resolve_processor(self) -> tuple[str, int, str]:
+        config = self.config()
+        local = config.get("local_processor") or {}
+        port = int_or_none(local.get("port")) or 2053
+        path = str(local.get("path") or "/")
+        if self.processor_host_override:
+            return self.processor_host_override, port, path
+        configured_host = str(local.get("manual_host") or "").strip()
+        if configured_host and configured_host != "0.0.0.0":
+            return configured_host, port, path
+        LOGGER.info("Discovering GoFree processors over multicast")
+        devices = discover_gofree_devices(self.discovery_timeout)
+        if not devices:
+            last_host = str(self.state.get("last_processor_host") or "").strip()
+            if last_host:
+                LOGGER.warning("No GoFree discovery result; falling back to last processor host %s", last_host)
+                return last_host, port, path
+            raise RuntimeError("No GoFree processor discovered")
+        selected = devices[0]
+        LOGGER.info("Selected GoFree processor: %s", selected.label)
+        self.state["last_discovered_device"] = selected.__dict__
+        self.save_state()
+        return selected.host, selected.port or port, path
+
+    def subscription_metrics(self) -> list[dict[str, Any]]:
+        metrics = self.config().get("metrics") or []
+        if not metrics:
+            raise RuntimeError("Matador config did not include metric subscriptions")
+        return [item for item in metrics if isinstance(item, dict) and int_or_none(item.get("id")) is not None]
+
+    def subscription_message(self) -> str:
+        return json.dumps(
+            {
+                "DataReq": [
+                    {"id": int(item["id"]), "repeat": True, "inst": 0}
+                    for item in self.subscription_metrics()
+                ]
+            },
+            separators=(",", ":"),
+        )
+
+    def data_info_message(self) -> str | None:
+        metric_ids = sorted(
+            {
+                metric_id
+                for item in self.subscription_metrics()
+                if str(item.get("name") or "") in GOFREE_DATA_INFO_METRIC_NAMES
+                for metric_id in [int_or_none(item.get("id"))]
+                if metric_id is not None and metric_id < 10000
+            }
+        )
+        return json.dumps({"DataInfoReq": metric_ids}, separators=(",", ":")) if metric_ids else None
+
+    def setting_message(self) -> str:
+        return json.dumps({"SettingReq": {"ids": [GOFREE_COMPASS_TRUE_MAG_SETTING_ID]}}, separators=(",", ":"))
+
+    async def request_metadata(self, websocket) -> None:
+        data_info_message = self.data_info_message()
+        if data_info_message:
+            await websocket.send(data_info_message)
+        await websocket.send(self.setting_message())
+
+    def update_data_info(self, payload: dict[str, Any]) -> bool:
+        data_info = payload.get("DataInfo")
+        if not isinstance(data_info, list):
+            return False
+        updated = False
+        for item in data_info:
+            if not isinstance(item, dict):
+                continue
+            metric_id = int_or_none(item.get("id"))
+            if metric_id is None:
+                continue
+            self.data_info_by_metric_id[metric_id] = dict(item)
+            updated = True
+        return updated
+
+    def update_settings(self, payload: dict[str, Any]) -> bool:
+        settings = payload.get("Setting")
+        if not isinstance(settings, list):
+            return False
+        updated = False
+        for item in settings:
+            if not isinstance(item, dict):
+                continue
+            setting_id = int_or_none(item.get("id"))
+            if setting_id is None:
+                continue
+            self.setting_by_id[setting_id] = dict(item)
+            updated = True
+        return updated
+
+    def metric_name_by_id(self) -> dict[int, str]:
+        return {
+            int(item["id"]): str(item.get("name") or "")
+            for item in self.subscription_metrics()
+            if int_or_none(item.get("id")) is not None
+        }
+
+    def compass_reference(self) -> str | None:
+        setting = self.setting_by_id.get(GOFREE_COMPASS_TRUE_MAG_SETTING_ID)
+        if not setting:
+            return None
+        value = int_or_none(setting.get("value"))
+        if value == 0:
+            return "magnetic"
+        if value == 1:
+            return "true"
+        return None
+
+    def enrich_data_item(self, item: dict[str, Any]) -> dict[str, Any]:
+        metric_id = int_or_none(item.get("id"))
+        if metric_id is None:
+            return dict(item)
+        metric_name = self.metric_name_by_id().get(metric_id, "")
+        enriched = dict(item)
+        info = self.data_info_by_metric_id.get(metric_id)
+        if info:
+            for key in ("sname", "lname", "unit", "min", "max"):
+                if key in info and enriched.get(key) is None:
+                    enriched[key] = info[key]
+        compass_reference = self.compass_reference()
+        if metric_name:
+            enriched.setdefault("metric_name", metric_name)
+        if metric_name in GOFREE_COMPASS_TRUE_MAG_METRIC_NAMES and compass_reference is not None:
+            enriched["compassTrueMagSettingId"] = GOFREE_COMPASS_TRUE_MAG_SETTING_ID
+            enriched["compassTrueMagSettingValue"] = 1 if compass_reference == "true" else 0
+            enriched["compassTrueMagReference"] = compass_reference
+            enriched["unit"] = "&deg;T" if compass_reference == "true" else "&deg;M"
+        return enriched
+
+    async def processor_loop(self) -> None:
+        backoff = 1.0
+        while not self.stop_event.is_set():
+            try:
+                await asyncio.to_thread(self.fetch_config)
+                if not self.processor_enabled:
+                    await asyncio.sleep(IDLE_SLEEP_SECONDS)
+                    continue
+                processor_host, processor_port, processor_path = self.resolve_processor()
+                await self.processor_once(processor_host, processor_port, processor_path)
+                backoff = 1.0
+            except Exception as exc:
+                LOGGER.warning("Processor loop interrupted: %s. Reconnecting in %.1fs", exc, backoff)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 60.0)
+
+    async def processor_once(self, processor_host: str, processor_port: int, processor_path: str) -> None:
+        self.data_info_by_metric_id.clear()
+        self.setting_by_id.clear()
+        url = f"ws://{processor_host}:{processor_port}{processor_path or '/'}"
+        LOGGER.info("Connecting to GoFree processor at %s", url)
+        async with websockets.connect(url, ping_interval=None, max_queue=1024) as websocket:
+            await websocket.send(self.subscription_message())
+            await self.request_metadata(websocket)
+            last_metadata_request = time.monotonic()
+            last_data_received = time.monotonic()
+            self.state["last_processor_host"] = processor_host
+            self.save_state()
+            LOGGER.info("Subscribed to %s GoFree metrics", len(self.subscription_metrics()))
+            while not self.stop_event.is_set() and self.processor_enabled:
+                if time.monotonic() - last_data_received >= self.data_silence_reconnect_seconds:
+                    LOGGER.warning(
+                        "No GoFree telemetry received for %.0fs; reconnecting processor websocket",
+                        self.data_silence_reconnect_seconds,
+                    )
+                    raise RuntimeError("GoFree processor telemetry silence timeout")
+                if time.monotonic() - last_metadata_request >= GOFREE_DATA_INFO_REFRESH_SECONDS:
+                    await self.request_metadata(websocket)
+                    last_metadata_request = time.monotonic()
+                try:
+                    message = await asyncio.wait_for(websocket.recv(), timeout=1.0)
+                except TimeoutError:
+                    continue
+                payload = json.loads(message.decode("utf-8") if isinstance(message, bytes) else message)
+                if self.update_data_info(payload) or self.update_settings(payload):
+                    LOGGER.debug("Updated GoFree processor metadata")
+                    continue
+                values = payload.get("Data") or []
+                if not isinstance(values, list) or not values:
+                    continue
+                last_data_received = time.monotonic()
+                outgoing = {
+                    "agent_kind": "pi_edge_agent",
+                    "app_version": APP_VERSION,
+                    "processor_host": processor_host,
+                    "sent_at": time.time(),
+                    "Data": [
+                        self.enrich_data_item(item)
+                        for item in values
+                        if isinstance(item, dict)
+                    ],
+                }
+                if not outgoing["Data"]:
+                    continue
+                await asyncio.to_thread(self.spool.enqueue, outgoing)
+
+    async def stream_loop(self) -> None:
+        backoff = 1.0
+        while not self.stop_event.is_set():
+            try:
+                await asyncio.to_thread(self.fetch_config)
+                if not self.streaming_enabled:
+                    await asyncio.sleep(IDLE_SLEEP_SECONDS)
+                    continue
+                await self.stream_once()
+                backoff = 1.0
+            except urllib.error.HTTPError as exc:
+                if exc.code in (401, 403):
+                    LOGGER.error("Matador rejected this Pi Edge Agent token; re-enrollment is required")
+                    self.stop_event.set()
+                    return
+                LOGGER.warning("Matador config failed: %s. Reconnecting in %.1fs", exc, backoff)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 60.0)
+            except Exception as exc:
+                LOGGER.warning("Upstream stream interrupted: %s. Reconnecting in %.1fs", exc, backoff)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 60.0)
+
+    async def stream_once(self) -> None:
+        token = self.device_token
+        if not token:
+            raise RuntimeError("No device token available")
+        upstream_url = f"{self.server_url.replace('https://', 'wss://').replace('http://', 'ws://')}/edge/stream?token={token}"
+        LOGGER.info("Connecting upstream to %s", upstream_url.split("?token=", 1)[0])
+        async with websockets.connect(upstream_url, ping_interval=30, ping_timeout=30) as websocket:
+            LOGGER.info("Upstream Matador stream connected")
+            while not self.stop_event.is_set() and self.streaming_enabled:
+                row = await asyncio.to_thread(self.spool.peek_oldest)
+                if row is None:
+                    await asyncio.sleep(IDLE_SLEEP_SECONDS)
+                    continue
+                payload_id, outgoing = row
+                outgoing["pi_health"] = self.health_payload()
+                await websocket.send(json.dumps(outgoing, separators=(",", ":")))
+                response_text = await asyncio.wait_for(websocket.recv(), timeout=5)
+                response = json.loads(response_text)
+                if not response.get("ok", False):
+                    raise RuntimeError(str(response.get("error") or "Matador rejected Edge payload"))
+                await asyncio.to_thread(self.spool.ack, payload_id)
+
+    async def run(self) -> None:
+        await asyncio.to_thread(self.fetch_config)
+        await asyncio.gather(self.config_loop(), self.processor_loop(), self.stream_loop())
+
+    async def config_loop(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                await asyncio.to_thread(self.fetch_config)
+            except urllib.error.HTTPError as exc:
+                if exc.code in (401, 403):
+                    LOGGER.error("Matador rejected this Pi Edge Agent token; re-enrollment is required")
+                    self.stop_event.set()
+                    return
+                LOGGER.warning("Config poll failed: %s", exc)
+            except Exception as exc:
+                LOGGER.warning("Config poll failed: %s", exc)
+            await asyncio.sleep(CONFIG_POLL_SECONDS)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Headless Matador Pi Edge Agent")
+    parser.add_argument("--server", default=os.environ.get("MATADOR_EDGE_SERVER", DEFAULT_SERVER), help="Matador server URL")
+    parser.add_argument("--state-dir", default=os.environ.get("MATADOR_PI_EDGE_STATE_DIR", str(default_state_dir())), help="State directory")
+    parser.add_argument("--enrollment-code", default=os.environ.get("MATADOR_EDGE_ENROLLMENT_CODE", ""), help="One-time Matador Edge enrollment code")
+    parser.add_argument("--processor-host", default=os.environ.get("MATADOR_PROCESSOR_HOST", ""), help="Optional fixed GoFree processor IP")
+    parser.add_argument("--discovery-timeout", type=float, default=float(os.environ.get("MATADOR_DISCOVERY_TIMEOUT", "8")), help="GoFree discovery timeout in seconds")
+    parser.add_argument(
+        "--data-silence-reconnect-seconds",
+        type=float,
+        default=float(os.environ.get("MATADOR_PI_EDGE_DATA_SILENCE_RECONNECT_SECONDS", str(GOFREE_DATA_SILENCE_RECONNECT_SECONDS))),
+        help="Reconnect the GoFree processor websocket if no telemetry Data messages arrive for this many seconds",
+    )
+    parser.add_argument(
+        "--spool-max-payloads",
+        "--queue-size",
+        dest="spool_max_payloads",
+        type=int,
+        default=int(os.environ.get("MATADOR_PI_EDGE_SPOOL_MAX_PAYLOADS", os.environ.get("MATADOR_PI_EDGE_QUEUE_SIZE", "50000"))),
+        help="Maximum durable outbound payloads to retain before oldest payloads are discarded",
+    )
+    parser.add_argument("--discover-once", action="store_true", help="Print discovered GoFree processors and exit")
+    parser.add_argument("--log-level", default=os.environ.get("MATADOR_PI_EDGE_LOG_LEVEL", "INFO"), help="Python logging level")
+    return parser.parse_args()
+
+
+def configure_logging(level: str) -> None:
+    logging.basicConfig(
+        level=getattr(logging, level.upper(), logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+
+
+def main() -> None:
+    args = parse_args()
+    configure_logging(args.log_level)
+    if args.discover_once:
+        for device in discover_gofree_devices(args.discovery_timeout):
+            print(device.label)
+        return
+    agent = PiEdgeAgent(
+        server_url=args.server,
+        state_dir=Path(args.state_dir),
+        enrollment_code=args.enrollment_code,
+        processor_host=args.processor_host,
+        discovery_timeout=args.discovery_timeout,
+        spool_max_payloads=args.spool_max_payloads,
+        data_silence_reconnect_seconds=args.data_silence_reconnect_seconds,
+    )
+    try:
+        asyncio.run(agent.run())
+    except KeyboardInterrupt:
+        LOGGER.info("Stopping Pi Edge Agent")
+
+
+if __name__ == "__main__":
+    main()

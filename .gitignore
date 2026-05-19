@@ -1,0 +1,9 @@
+.env
+*.sqlite
+*.sqlite3
+state.json
+state.json.*.tmp
+outbound-spool.sqlite3
+__pycache__/
+*.pyc
+.venv/
