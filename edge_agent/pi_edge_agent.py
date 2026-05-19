@@ -349,6 +349,10 @@ def discover_gofree_devices(timeout_seconds: float = 8.0) -> list[DiscoveredGoFr
     return unique_devices(devices)
 
 
+class RestartRequested(Exception):
+    """Raised when Matador asks systemd to restart the agent."""
+
+
 class PiEdgeAgent:
     def __init__(
         self,
@@ -534,7 +538,7 @@ class PiEdgeAgent:
             self.last_remote_command_at = requested_at
             self.state["last_remote_command_at"] = requested_at
             self.save_state()
-            raise SystemExit("Restart requested by Matador admin")
+            raise RestartRequested("Restart requested by Matador admin")
         else:
             LOGGER.warning("Ignoring unknown remote command: %s", action)
         self.state["processor_enabled"] = self.processor_enabled
@@ -744,6 +748,9 @@ class PiEdgeAgent:
                 processor_host, processor_port, processor_path = self.resolve_processor()
                 await self.processor_once(processor_host, processor_port, processor_path)
                 backoff = 1.0
+            except RestartRequested:
+                self.stop_event.set()
+                raise
             except Exception as exc:
                 LOGGER.warning("Processor loop interrupted: %s. Reconnecting in %.1fs", exc, backoff)
                 await asyncio.sleep(backoff)
@@ -811,6 +818,9 @@ class PiEdgeAgent:
                     continue
                 await self.stream_once()
                 backoff = 1.0
+            except RestartRequested:
+                self.stop_event.set()
+                raise
             except urllib.error.HTTPError as exc:
                 if exc.code in (401, 403):
                     LOGGER.error("Matador rejected this Pi Edge Agent token; re-enrollment is required")
@@ -856,6 +866,9 @@ class PiEdgeAgent:
         while not self.stop_event.is_set():
             try:
                 await asyncio.to_thread(self.fetch_config)
+            except RestartRequested:
+                self.stop_event.set()
+                raise
             except urllib.error.HTTPError as exc:
                 if exc.code in (401, 403):
                     LOGGER.error("Matador rejected this Pi Edge Agent token; re-enrollment is required")
@@ -918,6 +931,9 @@ def main() -> None:
     )
     try:
         asyncio.run(agent.run())
+    except RestartRequested:
+        LOGGER.info("Restart requested by Matador admin")
+        raise SystemExit(75)
     except KeyboardInterrupt:
         LOGGER.info("Stopping Pi Edge Agent")
 
