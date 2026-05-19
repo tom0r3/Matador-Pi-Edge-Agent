@@ -1,0 +1,8 @@
+[Unit]
+Description=Update Matador Pi Edge Agent
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/matador-pi-edge-agent/scripts/update.sh

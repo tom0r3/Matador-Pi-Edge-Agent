@@ -31,8 +31,11 @@ cd "$APP_DIR"
 
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
+chmod +x scripts/*.sh
 
 cp "deploy/$SERVICE_NAME" "/etc/systemd/system/$SERVICE_NAME"
+cp deploy/matador-pi-edge-update.service /etc/systemd/system/matador-pi-edge-update.service
+cp deploy/matador-pi-edge-update.timer /etc/systemd/system/matador-pi-edge-update.timer
 systemctl daemon-reload
 systemctl enable --now "$SERVICE_NAME"
 
@@ -41,5 +44,10 @@ echo "Matador Pi Edge Agent installed."
 echo "Watch the setup/claim logs with:"
 echo "  sudo journalctl -u $SERVICE_NAME -f"
 echo
+echo "Check local status with:"
+echo "  sudo $APP_DIR/scripts/status.sh"
+echo
+echo "Optional daily updates can be enabled with:"
+echo "  sudo systemctl enable --now matador-pi-edge-update.timer"
+echo
 echo "Approve the Pi in Matador Admin > Pending Pi Edge Agents."
-

@@ -75,6 +75,15 @@ class DiscoveredGoFreeDevice:
         prefix = f"{title} - " if title else ""
         return f"{prefix}{self.host}:{self.port} ({self.source})"
 
+    def identity(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "model": self.model,
+            "serial_number": self.serial_number,
+            "last_host": self.host,
+            "port": self.port,
+        }
+
 
 class PayloadSpool:
     def __init__(self, path: Path, max_rows: int) -> None:
@@ -135,6 +144,10 @@ class PayloadSpool:
     def ack(self, payload_id: int) -> None:
         with self._connect() as conn:
             conn.execute("DELETE FROM outbound_payloads WHERE id = ?", (payload_id,))
+
+    def clear(self) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM outbound_payloads")
 
     def stats(self) -> dict[str, Any]:
         with self._connect() as conn:
@@ -294,6 +307,19 @@ def unique_devices(devices: list[DiscoveredGoFreeDevice]) -> list[DiscoveredGoFr
     return sorted(unique, key=lambda item: (item.host, item.port, item.name))
 
 
+def device_matches_identity(device: DiscoveredGoFreeDevice, identity: dict[str, Any]) -> bool:
+    serial = str(identity.get("serial_number") or "").strip()
+    if serial and serial == device.serial_number:
+        return True
+    name = str(identity.get("name") or "").strip()
+    model = str(identity.get("model") or "").strip()
+    if name and model:
+        return name == device.name and model == device.model
+    if name:
+        return name == device.name
+    return False
+
+
 def discover_gofree_devices(timeout_seconds: float = 8.0) -> list[DiscoveredGoFreeDevice]:
     devices: list[DiscoveredGoFreeDevice] = []
     deadline = time.monotonic() + timeout_seconds
@@ -351,6 +377,11 @@ class PiEdgeAgent:
         self.processor_enabled = bool(self.state.get("processor_enabled", True))
         self.streaming_enabled = bool(self.state.get("streaming_enabled", True))
         self.last_remote_command_at = str(self.state.get("last_remote_command_at") or "")
+        self.counters = dict(self.state.get("counters") or {})
+
+    def increment_counter(self, name: str, amount: int = 1) -> None:
+        self.counters[name] = int(self.counters.get(name) or 0) + amount
+        self.state["counters"] = self.counters
 
     @property
     def device_token(self) -> str:
@@ -379,14 +410,20 @@ class PiEdgeAgent:
         device_uid, claim_token, claim_code = self.claim_identity()
         LOGGER.info("Requesting Matador admin claim approval with claim code %s", claim_code)
         local_host = str(self.state.get("last_processor_host") or self.processor_host_override or "").strip()
+        discovered_processors = []
+        with suppress(Exception):
+            devices = discover_gofree_devices(min(self.discovery_timeout, 3.0))
+            discovered_processors = [device.identity() for device in devices]
+            if devices:
+                self.state["last_discovered_processors"] = discovered_processors
+                self.state["last_discovered_device"] = devices[0].__dict__
+                self.save_state()
+                if not local_host:
+                    local_host = devices[0].host
+                    self.state["last_processor_host"] = devices[0].host
         if not local_host:
             with suppress(Exception):
-                devices = discover_gofree_devices(min(self.discovery_timeout, 3.0))
-                if devices:
-                    self.state["last_discovered_device"] = devices[0].__dict__
-                    self.state["last_processor_host"] = devices[0].host
-                    self.save_state()
-                    local_host = devices[0].host
+                local_host = str(self.state.get("last_processor_host") or "").strip()
         return request_json(
             self.server_url,
             "/edge/pi-claim",
@@ -398,6 +435,7 @@ class PiEdgeAgent:
                 "app_version": APP_VERSION,
                 "client_hostname": hostname(),
                 "local_processor_host": local_host or None,
+                "discovered_processors": discovered_processors,
                 "pi_health": self.health_payload(),
             },
         )
@@ -489,6 +527,14 @@ class PiEdgeAgent:
             self.streaming_enabled = True
         elif action == "stop_streaming":
             self.streaming_enabled = False
+        elif action == "clear_queue":
+            self.spool.clear()
+        elif action == "restart_agent":
+            self.acknowledge_remote_command(requested_at)
+            self.last_remote_command_at = requested_at
+            self.state["last_remote_command_at"] = requested_at
+            self.save_state()
+            raise SystemExit("Restart requested by Matador admin")
         else:
             LOGGER.warning("Ignoring unknown remote command: %s", action)
         self.state["processor_enabled"] = self.processor_enabled
@@ -515,12 +561,22 @@ class PiEdgeAgent:
                 "spool": self.spool.stats(),
             },
             "system": load_average(),
+            "counters": self.counters,
             "last_discovered_device": self.state.get("last_discovered_device") or None,
+            "last_discovered_processors": self.state.get("last_discovered_processors") or [],
+            "locked_processor_identity": self.locked_processor_identity(),
             "last_processor_host": self.state.get("last_processor_host") or None,
         }
 
     def config(self) -> dict[str, Any]:
         return self.current_config or self.state.get("config") or {}
+
+    def locked_processor_identity(self) -> dict[str, Any] | None:
+        config_lock = self.config().get("processor_lock")
+        if isinstance(config_lock, dict) and config_lock:
+            return config_lock
+        state_lock = self.state.get("locked_processor_identity")
+        return state_lock if isinstance(state_lock, dict) and state_lock else None
 
     def resolve_processor(self) -> tuple[str, int, str]:
         config = self.config()
@@ -530,19 +586,43 @@ class PiEdgeAgent:
         if self.processor_host_override:
             return self.processor_host_override, port, path
         configured_host = str(local.get("manual_host") or "").strip()
-        if configured_host and configured_host != "0.0.0.0":
-            return configured_host, port, path
+        lock = self.locked_processor_identity()
         LOGGER.info("Discovering GoFree processors over multicast")
         devices = discover_gofree_devices(self.discovery_timeout)
+        discovered_processors = [device.identity() for device in devices]
+        self.state["last_discovered_processors"] = discovered_processors
+        if devices:
+            self.state["last_discovered_device"] = devices[0].__dict__
+        self.save_state()
+        if lock:
+            selected = next((device for device in devices if device_matches_identity(device, lock)), None)
+            if selected:
+                LOGGER.info("Selected locked GoFree processor: %s", selected.label)
+                self.state["locked_processor_identity"] = selected.identity()
+                self.state["last_processor_host"] = selected.host
+                self.save_state()
+                return selected.host, selected.port or port, path
+            last_host = str(lock.get("last_host") or configured_host or "").strip()
+            if last_host and last_host != "0.0.0.0":
+                LOGGER.warning("Locked GoFree processor not discovered; trying last known host %s", last_host)
+                return last_host, int_or_none(lock.get("port")) or port, path
+            raise RuntimeError("Locked GoFree processor was not discovered")
+        if configured_host and configured_host != "0.0.0.0":
+            return configured_host, port, path
         if not devices:
             last_host = str(self.state.get("last_processor_host") or "").strip()
             if last_host:
                 LOGGER.warning("No GoFree discovery result; falling back to last processor host %s", last_host)
                 return last_host, port, path
             raise RuntimeError("No GoFree processor discovered")
+        if len(devices) > 1:
+            labels = "; ".join(device.label for device in devices[:5])
+            raise RuntimeError(f"Multiple GoFree processors discovered; admin processor lock required. Found: {labels}")
         selected = devices[0]
         LOGGER.info("Selected GoFree processor: %s", selected.label)
         self.state["last_discovered_device"] = selected.__dict__
+        self.state["last_discovered_processors"] = [selected.identity()]
+        self.state["last_processor_host"] = selected.host
         self.save_state()
         return selected.host, selected.port or port, path
 
@@ -704,6 +784,7 @@ class PiEdgeAgent:
                 if not isinstance(values, list) or not values:
                     continue
                 last_data_received = time.monotonic()
+                self.increment_counter("processor_messages_received")
                 outgoing = {
                     "agent_kind": "pi_edge_agent",
                     "app_version": APP_VERSION,
@@ -717,6 +798,7 @@ class PiEdgeAgent:
                 }
                 if not outgoing["Data"]:
                     continue
+                self.increment_counter("processor_payloads_queued")
                 await asyncio.to_thread(self.spool.enqueue, outgoing)
 
     async def stream_loop(self) -> None:
@@ -761,8 +843,10 @@ class PiEdgeAgent:
                 response_text = await asyncio.wait_for(websocket.recv(), timeout=5)
                 response = json.loads(response_text)
                 if not response.get("ok", False):
+                    self.increment_counter("upstream_payloads_failed")
                     raise RuntimeError(str(response.get("error") or "Matador rejected Edge payload"))
                 await asyncio.to_thread(self.spool.ack, payload_id)
+                self.increment_counter("upstream_payloads_sent")
 
     async def run(self) -> None:
         await asyncio.to_thread(self.fetch_config)

@@ -22,9 +22,11 @@ git pull --ff-only
 
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
+chmod +x scripts/*.sh
 
 cp "deploy/$SERVICE_NAME" "/etc/systemd/system/$SERVICE_NAME"
+cp deploy/matador-pi-edge-update.service /etc/systemd/system/matador-pi-edge-update.service
+cp deploy/matador-pi-edge-update.timer /etc/systemd/system/matador-pi-edge-update.timer
 systemctl daemon-reload
 systemctl restart "$SERVICE_NAME"
 systemctl status "$SERVICE_NAME" --no-pager -l
-
