@@ -22,7 +22,7 @@ import websockets
 
 
 APP_NAME = "Matador Pi Edge Agent"
-APP_VERSION = "3.5.0"
+DEFAULT_APP_VERSION = "3.5.2"
 DEFAULT_SERVER = "https://matador.torodatasystems.eu"
 GOFREE_DISCOVERY_GROUP = "239.2.1.1"
 GOFREE_DISCOVERY_PORTS = (2052, 2050)
@@ -43,6 +43,21 @@ GOFREE_DATA_INFO_METRIC_NAMES = {
 GOFREE_COMPASS_TRUE_MAG_METRIC_NAMES = {"HEADING", "TWD", "START_LINE_BEARING"}
 
 LOGGER = logging.getLogger("matador_pi_edge_agent")
+
+
+def resolve_app_version() -> str:
+    env_version = os.environ.get("MATADOR_PI_EDGE_VERSION", "").strip()
+    if env_version:
+        return env_version
+    for version_path in (Path.cwd() / "VERSION", Path(__file__).resolve().parents[1] / "VERSION"):
+        with suppress(OSError):
+            version = version_path.read_text(encoding="utf-8").strip()
+            if version:
+                return version
+    return DEFAULT_APP_VERSION
+
+
+APP_VERSION = resolve_app_version()
 
 
 @dataclass(frozen=True)
