@@ -1,9 +1,1 @@
-asyncpg==0.30.0
-argon2-cffi==23.1.0
-fastapi==0.115.6
-playwright==1.53.0
-python-dotenv==1.1.0
-uvicorn[standard]==0.34.0
-websockets==15.0.1
-python-multipart==0.0.20
-numpy==2.2.6
+websockets>=12.0
