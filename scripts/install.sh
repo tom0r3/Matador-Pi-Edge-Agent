@@ -42,3 +42,4 @@ echo "Watch the setup/claim logs with:"
 echo "  sudo journalctl -u $SERVICE_NAME -f"
 echo
 echo "Approve the Pi in Matador Admin > Pending Pi Edge Agents."
+

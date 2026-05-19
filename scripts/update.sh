@@ -27,3 +27,4 @@ cp "deploy/$SERVICE_NAME" "/etc/systemd/system/$SERVICE_NAME"
 systemctl daemon-reload
 systemctl restart "$SERVICE_NAME"
 systemctl status "$SERVICE_NAME" --no-pager -l
+
