@@ -5,6 +5,7 @@ APP_DIR="${MATADOR_PI_EDGE_APP_DIR:-/opt/matador-pi-edge-agent}"
 APP_USER="${MATADOR_PI_EDGE_USER:-matador-edge}"
 REPO_URL="${MATADOR_PI_EDGE_REPO_URL:-https://github.com/tom0r3/Matador-Pi-Edge-Agent.git}"
 SERVICE_NAME="matador-pi-edge-agent.service"
+START_NOW="${MATADOR_PI_EDGE_START_NOW:-1}"
 
 if [ "$(id -u)" -ne 0 ]; then
   echo "Please run as root, for example: sudo ./scripts/install.sh" >&2
@@ -56,10 +57,20 @@ cp "deploy/$SERVICE_NAME" "/etc/systemd/system/$SERVICE_NAME"
 cp deploy/matador-pi-edge-update.service /etc/systemd/system/matador-pi-edge-update.service
 cp deploy/matador-pi-edge-update.timer /etc/systemd/system/matador-pi-edge-update.timer
 systemctl daemon-reload
-systemctl enable --now "$SERVICE_NAME"
+if [ "$START_NOW" = "0" ] || [ "$START_NOW" = "false" ] || [ "$START_NOW" = "no" ]; then
+  rm -rf /var/lib/matador-pi-edge-agent
+  hostnamectl set-hostname matador-pi-edge
+  systemctl enable "$SERVICE_NAME"
+  systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
+  START_MESSAGE="Service is enabled for the customer's first boot, but was not started during install."
+else
+  systemctl enable --now "$SERVICE_NAME"
+  START_MESSAGE="Service has been started and will phone home when network is available."
+fi
 
 echo
 echo "Matador Pi Edge Agent installed."
+echo "$START_MESSAGE"
 echo "Watch the setup/claim logs with:"
 echo "  sudo journalctl -u $SERVICE_NAME -f"
 echo

@@ -269,6 +269,35 @@ def hostname() -> str:
         return "matador-pi-edge-agent"
 
 
+def stable_device_suffix() -> str:
+    candidates: list[str] = []
+    for path in (Path("/etc/machine-id"), Path("/var/lib/dbus/machine-id")):
+        with suppress(OSError):
+            value = path.read_text(encoding="utf-8").strip()
+            if value:
+                candidates.append(value)
+    for interface_path in Path("/sys/class/net").glob("*/address") if Path("/sys/class/net").exists() else []:
+        if interface_path.parent.name == "lo":
+            continue
+        with suppress(OSError):
+            value = interface_path.read_text(encoding="utf-8").strip()
+            if value and value != "00:00:00:00:00:00":
+                candidates.append(value)
+    seed = "|".join(candidates) or str(uuid.uuid4())
+    return hashlib.sha256(seed.encode("utf-8")).hexdigest()[:6]
+
+
+def hostname_is_generic(value: str) -> bool:
+    normalized = value.strip().lower()
+    return normalized in {
+        "raspberrypi",
+        "matador-pi-edge",
+        "matador-pi-edge-agent",
+        "localhost",
+        "localhost.localdomain",
+    }
+
+
 def disk_stats(path: Path) -> dict[str, Any]:
     try:
         usage = shutil.disk_usage(path)
@@ -792,6 +821,27 @@ class PiEdgeAgent:
         self.run_checked_command(["sudo", "-n", "hostnamectl", "set-hostname", cleaned], timeout=15)
         self.state["requested_hostname"] = cleaned
 
+    def ensure_unique_hostname_for_golden_image(self) -> None:
+        if os.name == "nt" or self.state.get("hostname_uniqued_at") or self.state.get("requested_hostname"):
+            return
+        current = hostname()
+        if not hostname_is_generic(current):
+            self.state["hostname_uniqued_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            self.state["hostname_uniqued_from"] = current
+            self.save_state()
+            return
+        new_hostname = f"matador-pi-edge-{stable_device_suffix()}"
+        try:
+            self.set_system_hostname(new_hostname)
+            self.state["hostname_uniqued_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            self.state["hostname_uniqued_from"] = current
+            LOGGER.info("Updated generic hostname %s to %s for cloned-image uniqueness", current, new_hostname)
+            self.save_state()
+        except Exception as exc:
+            LOGGER.warning("Unable to set unique first-boot hostname: %s", exc)
+            self.state["hostname_uniquing_error"] = str(exc)
+            self.save_state()
+
     def handle_remote_command(self, command: dict[str, Any]) -> None:
         raw_action = str(command.get("action") or "").strip()
         action, _, argument = raw_action.partition("|")
@@ -896,6 +946,9 @@ class PiEdgeAgent:
                 "hostname": hostname(),
                 "latest_server_version": server_version,
                 "update_available": bool(server_version and server_version != APP_VERSION),
+                "hostname_uniqued_at": self.state.get("hostname_uniqued_at") or None,
+                "hostname_uniqued_from": self.state.get("hostname_uniqued_from") or None,
+                "hostname_uniquing_error": self.state.get("hostname_uniquing_error") or None,
             },
             "controls": {
                 "processor_enabled": self.processor_enabled,
@@ -1323,6 +1376,7 @@ class PiEdgeAgent:
                 self.save_state()
 
     async def run(self) -> None:
+        await asyncio.to_thread(self.ensure_unique_hostname_for_golden_image)
         await asyncio.to_thread(self.fetch_config)
         await asyncio.gather(self.config_loop(), self.processor_loop(), self.stream_loop())
 
