@@ -25,6 +25,7 @@ from pathlib import Path
 state_dir = Path(os.environ.get("MATADOR_PI_EDGE_STATE_DIR", "/var/lib/matador-pi-edge-agent"))
 state_path = state_dir / "state.json"
 spool_path = state_dir / "outbound-spool.sqlite3"
+golden_hostname_marker = state_dir / "golden-image-hostname.pending"
 
 state = {}
 if state_path.exists():
@@ -32,6 +33,11 @@ if state_path.exists():
 
 print(f"Claim code: {state.get('claim_code') or '-'}")
 print(f"Device token present: {'yes' if state.get('device_token') else 'no'}")
+print(f"Golden hostname pending: {'yes' if golden_hostname_marker.exists() else 'no'}")
+print(f"Hostname uniqued at: {state.get('hostname_uniqued_at') or '-'}")
+print(f"Hostname uniqued from: {state.get('hostname_uniqued_from') or '-'}")
+print(f"Requested hostname: {state.get('requested_hostname') or '-'}")
+print(f"Hostname uniquing error: {state.get('hostname_uniquing_error') or '-'}")
 print(f"Processor enabled: {state.get('processor_enabled', True)}")
 print(f"Streaming enabled: {state.get('streaming_enabled', True)}")
 print(f"Last config: {state.get('last_config_at') or '-'}")

@@ -5,6 +5,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import secrets
 import shutil
 import socket
@@ -33,6 +34,7 @@ GOFREE_PROCESSOR_PING_INTERVAL_SECONDS = 30.0
 GOFREE_PROCESSOR_PING_TIMEOUT_SECONDS = 15.0
 UPLOAD_BATCH_MAX_READINGS = 250
 UPLOAD_BATCH_MAX_PAYLOADS = 50
+GOLDEN_IMAGE_HOSTNAME_MARKER = "golden-image-hostname.pending"
 CONFIG_POLL_SECONDS = 10.0
 CLAIM_POLL_SECONDS = 15.0
 IDLE_SLEEP_SECONDS = 1.0
@@ -270,20 +272,33 @@ def hostname() -> str:
 
 
 def stable_device_suffix() -> str:
-    candidates: list[str] = []
+    hardware_candidates: list[str] = []
+    with suppress(OSError):
+        for line in Path("/proc/cpuinfo").read_text(encoding="utf-8").splitlines():
+            key, _, value = line.partition(":")
+            if key.strip().lower() == "serial":
+                serial = value.strip().lower()
+                if serial and serial.strip("0"):
+                    hardware_candidates.append(f"cpu:{serial}")
+                    break
+    for interface_path in sorted(Path("/sys/class/net").glob("*/address")) if Path("/sys/class/net").exists() else []:
+        interface_name = interface_path.parent.name
+        if interface_name == "lo" or interface_name.startswith(("docker", "veth", "br-", "virbr")):
+            continue
+        with suppress(OSError):
+            value = interface_path.read_text(encoding="utf-8").strip().lower()
+            if value and value != "00:00:00:00:00:00":
+                hardware_candidates.append(f"mac:{interface_name}:{value}")
+    if hardware_candidates:
+        return hashlib.sha256("|".join(hardware_candidates).encode("utf-8")).hexdigest()[:6]
+
+    cloned_os_candidates: list[str] = []
     for path in (Path("/etc/machine-id"), Path("/var/lib/dbus/machine-id")):
         with suppress(OSError):
             value = path.read_text(encoding="utf-8").strip()
             if value:
-                candidates.append(value)
-    for interface_path in Path("/sys/class/net").glob("*/address") if Path("/sys/class/net").exists() else []:
-        if interface_path.parent.name == "lo":
-            continue
-        with suppress(OSError):
-            value = interface_path.read_text(encoding="utf-8").strip()
-            if value and value != "00:00:00:00:00:00":
-                candidates.append(value)
-    seed = "|".join(candidates) or str(uuid.uuid4())
+                cloned_os_candidates.append(f"machine:{value}")
+    seed = "|".join(cloned_os_candidates) or str(uuid.uuid4())
     return hashlib.sha256(seed.encode("utf-8")).hexdigest()[:6]
 
 
@@ -296,6 +311,10 @@ def hostname_is_generic(value: str) -> bool:
         "localhost",
         "localhost.localdomain",
     }
+
+
+def hostname_is_generated_by_agent(value: str) -> bool:
+    return re.fullmatch(r"matador-pi-edge-[0-9a-f]{6}", value.strip().lower()) is not None
 
 
 def disk_stats(path: Path) -> dict[str, Any]:
@@ -822,20 +841,36 @@ class PiEdgeAgent:
         self.state["requested_hostname"] = cleaned
 
     def ensure_unique_hostname_for_golden_image(self) -> None:
-        if os.name == "nt" or self.state.get("hostname_uniqued_at") or self.state.get("requested_hostname"):
+        if os.name == "nt":
             return
-        current = hostname()
-        if not hostname_is_generic(current):
+        marker_path = self.state_dir / GOLDEN_IMAGE_HOSTNAME_MARKER
+        marker_pending = marker_path.exists()
+        current = hostname().strip().lower()
+        generated_hostname = f"matador-pi-edge-{stable_device_suffix()}"
+        current_is_stale_generated_clone = hostname_is_generated_by_agent(current) and current != generated_hostname
+        should_generate = marker_pending or hostname_is_generic(current) or current_is_stale_generated_clone
+        if not should_generate:
+            if self.state.get("hostname_uniqued_at") or self.state.get("requested_hostname"):
+                return
             self.state["hostname_uniqued_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             self.state["hostname_uniqued_from"] = current
             self.save_state()
             return
-        new_hostname = f"matador-pi-edge-{stable_device_suffix()}"
-        try:
-            self.set_system_hostname(new_hostname)
+        if current == generated_hostname:
             self.state["hostname_uniqued_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             self.state["hostname_uniqued_from"] = current
-            LOGGER.info("Updated generic hostname %s to %s for cloned-image uniqueness", current, new_hostname)
+            self.state["requested_hostname"] = generated_hostname
+            with suppress(OSError):
+                marker_path.unlink()
+            self.save_state()
+            return
+        try:
+            self.set_system_hostname(generated_hostname)
+            self.state["hostname_uniqued_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            self.state["hostname_uniqued_from"] = current
+            with suppress(OSError):
+                marker_path.unlink()
+            LOGGER.info("Updated hostname %s to %s for cloned-image uniqueness", current, generated_hostname)
             self.save_state()
         except Exception as exc:
             LOGGER.warning("Unable to set unique first-boot hostname: %s", exc)

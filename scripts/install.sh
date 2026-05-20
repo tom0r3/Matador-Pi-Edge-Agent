@@ -2,6 +2,7 @@
 set -euo pipefail
 
 APP_DIR="${MATADOR_PI_EDGE_APP_DIR:-/opt/matador-pi-edge-agent}"
+STATE_DIR="${MATADOR_PI_EDGE_STATE_DIR:-/var/lib/matador-pi-edge-agent}"
 APP_USER="${MATADOR_PI_EDGE_USER:-matador-edge}"
 REPO_URL="${MATADOR_PI_EDGE_REPO_URL:-https://github.com/tom0r3/Matador-Pi-Edge-Agent.git}"
 SERVICE_NAME="matador-pi-edge-agent.service"
@@ -58,7 +59,10 @@ cp deploy/matador-pi-edge-update.service /etc/systemd/system/matador-pi-edge-upd
 cp deploy/matador-pi-edge-update.timer /etc/systemd/system/matador-pi-edge-update.timer
 systemctl daemon-reload
 if [ "$START_NOW" = "0" ] || [ "$START_NOW" = "false" ] || [ "$START_NOW" = "no" ]; then
-  rm -rf /var/lib/matador-pi-edge-agent
+  rm -rf "$STATE_DIR"
+  install -d -o "$APP_USER" -g "$APP_USER" -m 0750 "$STATE_DIR"
+  touch "$STATE_DIR/golden-image-hostname.pending"
+  chown "$APP_USER:$APP_USER" "$STATE_DIR/golden-image-hostname.pending"
   hostnamectl set-hostname matador-pi-edge
   systemctl enable "$SERVICE_NAME"
   systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
