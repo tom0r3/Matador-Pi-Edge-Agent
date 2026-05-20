@@ -36,6 +36,8 @@ CONFIG_POLL_SECONDS = 10.0
 CLAIM_POLL_SECONDS = 15.0
 IDLE_SLEEP_SECONDS = 1.0
 GOFREE_COMPASS_TRUE_MAG_SETTING_ID = 21
+GOFREE_BARCODE_SERIAL_SETTING_ID = 89
+GOFREE_SETTING_IDS = (GOFREE_COMPASS_TRUE_MAG_SETTING_ID, GOFREE_BARCODE_SERIAL_SETTING_ID)
 GOFREE_DATA_INFO_METRIC_NAMES = {
     "COG",
     "HEADING",
@@ -75,7 +77,7 @@ class DiscoveredGoFreeDevice:
 
     @property
     def label(self) -> str:
-        title = " - ".join(part for part in (self.name, self.model, self.serial_number) if part)
+        title = " - ".join(part for part in (self.name, self.model, normalized_serial_number(self.serial_number)) if part)
         prefix = f"{title} - " if title else ""
         return f"{prefix}{self.host}:{self.port} ({self.source})"
 
@@ -83,7 +85,7 @@ class DiscoveredGoFreeDevice:
         return {
             "name": self.name,
             "model": self.model,
-            "serial_number": self.serial_number,
+            "serial_number": normalized_serial_number(self.serial_number),
             "last_host": self.host,
             "port": self.port,
         }
@@ -248,6 +250,11 @@ def float_or_none(value: Any) -> float | None:
         return None
 
 
+def normalized_serial_number(value: Any) -> str:
+    serial = str(value or "").strip()
+    return "" if serial.lower() in {"", "0", "n/a", "na", "none", "null"} else serial
+
+
 def hostname() -> str:
     try:
         return socket.gethostname()
@@ -351,8 +358,9 @@ def unique_devices(devices: list[DiscoveredGoFreeDevice]) -> list[DiscoveredGoFr
 
 
 def device_matches_identity(device: DiscoveredGoFreeDevice, identity: dict[str, Any]) -> bool:
-    serial = str(identity.get("serial_number") or "").strip()
-    if serial and serial == device.serial_number:
+    serial = normalized_serial_number(identity.get("serial_number"))
+    device_serial = normalized_serial_number(device.serial_number)
+    if serial and device_serial and serial == device_serial:
         return True
     name = str(identity.get("name") or "").strip()
     model = str(identity.get("model") or "").strip()
@@ -433,6 +441,7 @@ class PiEdgeAgent:
         self.streaming_enabled = bool(self.state.get("streaming_enabled", True))
         self.last_remote_command_at = str(self.state.get("last_remote_command_at") or "")
         self.counters = dict(self.state.get("counters") or {})
+        self.current_processor_identity = dict(self.state.get("current_processor_identity") or {})
 
     def increment_counter(self, name: str, amount: int = 1) -> None:
         self.counters[name] = int(self.counters.get(name) or 0) + amount
@@ -625,6 +634,7 @@ class PiEdgeAgent:
             "last_discovered_device": self.state.get("last_discovered_device") or None,
             "last_discovered_processors": self.state.get("last_discovered_processors") or [],
             "locked_processor_identity": self.locked_processor_identity(),
+            "current_processor_identity": self.current_processor_identity or None,
             "last_processor_host": self.state.get("last_processor_host") or None,
         }
 
@@ -637,6 +647,46 @@ class PiEdgeAgent:
             return config_lock
         state_lock = self.state.get("locked_processor_identity")
         return state_lock if isinstance(state_lock, dict) and state_lock else None
+
+    def set_current_processor_identity(self, identity: dict[str, Any]) -> None:
+        cleaned = {
+            "name": str(identity.get("name") or "").strip(),
+            "model": str(identity.get("model") or "").strip(),
+            "serial_number": normalized_serial_number(identity.get("serial_number")),
+            "last_host": str(identity.get("last_host") or "").strip(),
+            "port": int_or_none(identity.get("port")) or 2053,
+        }
+        self.current_processor_identity = cleaned
+        self.state["current_processor_identity"] = cleaned
+
+    def h5000_barcode_serial_number(self) -> str:
+        setting = self.setting_by_id.get(GOFREE_BARCODE_SERIAL_SETTING_ID)
+        if not setting:
+            return ""
+        for key in ("valStr", "value_text", "text", "str", "value", "val"):
+            serial = normalized_serial_number(setting.get(key))
+            if serial:
+                return serial
+        return ""
+
+    def refresh_processor_identity_from_settings(self) -> None:
+        serial = self.h5000_barcode_serial_number()
+        if not serial or not self.current_processor_identity:
+            return
+        if self.current_processor_identity.get("serial_number") == serial:
+            return
+        previous_serial = self.current_processor_identity.get("serial_number") or "none"
+        self.current_processor_identity["serial_number"] = serial
+        LOGGER.info("Resolved GoFree processor barcode serial from setting %s: %s (was %s)", GOFREE_BARCODE_SERIAL_SETTING_ID, serial, previous_serial)
+        self.state["current_processor_identity"] = dict(self.current_processor_identity)
+        lock = self.locked_processor_identity()
+        if lock and str(lock.get("name") or "") == str(self.current_processor_identity.get("name") or ""):
+            lock = dict(lock)
+            lock["serial_number"] = serial
+            lock["last_host"] = self.current_processor_identity.get("last_host") or lock.get("last_host")
+            lock["port"] = self.current_processor_identity.get("port") or lock.get("port")
+            self.state["locked_processor_identity"] = lock
+        self.save_state()
 
     def resolve_processor(self) -> tuple[str, int, str]:
         config = self.config()
@@ -658,6 +708,7 @@ class PiEdgeAgent:
             selected = next((device for device in devices if device_matches_identity(device, lock)), None)
             if selected:
                 LOGGER.info("Selected locked GoFree processor: %s", selected.label)
+                self.set_current_processor_identity(selected.identity())
                 self.state["locked_processor_identity"] = selected.identity()
                 self.state["last_processor_host"] = selected.host
                 self.save_state()
@@ -665,6 +716,10 @@ class PiEdgeAgent:
             last_host = str(lock.get("last_host") or configured_host or "").strip()
             if last_host and last_host != "0.0.0.0":
                 LOGGER.warning("Locked GoFree processor not discovered; trying last known host %s", last_host)
+                fallback_identity = dict(lock)
+                fallback_identity["last_host"] = last_host
+                fallback_identity["port"] = int_or_none(lock.get("port")) or port
+                self.set_current_processor_identity(fallback_identity)
                 return last_host, int_or_none(lock.get("port")) or port, path
             raise RuntimeError("Locked GoFree processor was not discovered")
         if configured_host and configured_host != "0.0.0.0":
@@ -683,6 +738,7 @@ class PiEdgeAgent:
         self.state["last_discovered_device"] = selected.__dict__
         self.state["last_discovered_processors"] = [selected.identity()]
         self.state["last_processor_host"] = selected.host
+        self.set_current_processor_identity(selected.identity())
         self.save_state()
         return selected.host, selected.port or port, path
 
@@ -716,7 +772,7 @@ class PiEdgeAgent:
         return json.dumps({"DataInfoReq": metric_ids}, separators=(",", ":")) if metric_ids else None
 
     def setting_message(self) -> str:
-        return json.dumps({"SettingReq": {"ids": [GOFREE_COMPASS_TRUE_MAG_SETTING_ID]}}, separators=(",", ":"))
+        return json.dumps({"SettingReq": {"ids": list(GOFREE_SETTING_IDS)}}, separators=(",", ":"))
 
     async def request_metadata(self, websocket) -> None:
         data_info_message = self.data_info_message()
@@ -752,6 +808,8 @@ class PiEdgeAgent:
                 continue
             self.setting_by_id[setting_id] = dict(item)
             updated = True
+        if updated:
+            self.refresh_processor_identity_from_settings()
         return updated
 
     def metric_name_by_id(self) -> dict[int, str]:
@@ -857,6 +915,7 @@ class PiEdgeAgent:
                     "agent_kind": "pi_edge_agent",
                     "app_version": APP_VERSION,
                     "processor_host": processor_host,
+                    "processor_identity": self.current_processor_identity or None,
                     "sent_at": time.time(),
                     "Data": [
                         self.enrich_data_item(item)

@@ -26,8 +26,9 @@ commands, health/storage telemetry, and no-code admin claiming.
   defaults of 30 seconds interval and 15 seconds timeout.
 - Fetches Matador Edge config and subscribes to the server-provided metric list.
 - Sends `DataReq` plus `DataInfoReq` metadata refreshes for direction metrics.
-- Sends `SettingReq {"ids":[21]}` so Matador can identify true/magnetic
-  heading and wind-direction reference when the processor provides it.
+- Sends `SettingReq {"ids":[21,89]}` so Matador can identify true/magnetic
+  heading reference and, on H5000/v1 processors, the barcode serial used for
+  stable processor locking.
 - Streams live processor data to Matador over WSS using the existing
   `/edge/stream` endpoint.
 - Stores unsent payloads in a durable SQLite spool at
@@ -143,3 +144,7 @@ Use a fixed processor IP if multicast discovery is unavailable:
   is not yet a dedicated Pi appliance fleet-management page.
 - Processor identity locking is available from Admin approval. It prefers
   serial number, then name/model, then name, so DHCP address changes are safe.
+  Hercules/v2 processors normally advertise the serial in discovery. H5000/v1
+  processors may advertise `0`, so the Pi reads setting `89` after connection
+  and backfills the barcode serial. Zeus/MFD discovery does not expose a serial,
+  so those locks intentionally fall back to name/model.
