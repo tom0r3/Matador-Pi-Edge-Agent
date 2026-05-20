@@ -603,11 +603,32 @@ class PiEdgeAgent:
             default=str,
         )
 
+    def run_checked_command(self, command: list[str], *, timeout: int, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+        try:
+            result = subprocess.run(
+                command,
+                cwd=str(cwd) if cwd else None,
+                text=True,
+                capture_output=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(f"{' '.join(command)} timed out after {timeout}s") from exc
+        output = "\n".join(part.strip() for part in (result.stdout, result.stderr) if part and part.strip())
+        if result.returncode != 0:
+            detail = output or f"exit status {result.returncode}"
+            raise RuntimeError(f"{' '.join(command)} failed: {detail}")
+        if output:
+            LOGGER.info("Command %s output: %s", " ".join(command), output)
+        return result
+
     def run_background_update(self) -> None:
         script = Path(__file__).resolve().parents[1] / "scripts" / "update.sh"
         if not script.exists():
             raise RuntimeError(f"Update script not found: {script}")
         command = ["sudo", "-n", str(script)] if os.name != "nt" else [str(script)]
+        if os.name != "nt":
+            self.run_checked_command(["sudo", "-n", "true"], timeout=5)
         subprocess.Popen(command, cwd=str(script.parents[1]), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def set_auto_update_timer(self, enabled: bool) -> None:
@@ -620,7 +641,7 @@ class PiEdgeAgent:
         else:
             command.append("--now")
         command.append("matador-pi-edge-update.timer")
-        subprocess.run(command, check=True, timeout=20)
+        self.run_checked_command(command, timeout=20)
 
     def set_system_hostname(self, requested_hostname: str) -> None:
         cleaned = "".join(ch for ch in requested_hostname.strip().lower() if ch.isalnum() or ch == "-").strip("-")
@@ -628,7 +649,7 @@ class PiEdgeAgent:
             raise RuntimeError("Hostname must contain letters, numbers, or hyphens and be 1-63 characters")
         if os.name == "nt":
             raise RuntimeError("Hostname changes are only supported on Raspberry Pi/Linux agents")
-        subprocess.run(["sudo", "-n", "hostnamectl", "set-hostname", cleaned], check=True, timeout=15)
+        self.run_checked_command(["sudo", "-n", "hostnamectl", "set-hostname", cleaned], timeout=15)
         self.state["requested_hostname"] = cleaned
 
     def handle_remote_command(self, command: dict[str, Any]) -> None:
