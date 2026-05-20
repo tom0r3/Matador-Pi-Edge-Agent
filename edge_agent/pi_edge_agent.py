@@ -27,7 +27,9 @@ DEFAULT_SERVER = "https://matador.torodatasystems.eu"
 GOFREE_DISCOVERY_GROUP = "239.2.1.1"
 GOFREE_DISCOVERY_PORTS = (2052, 2050)
 GOFREE_DATA_INFO_REFRESH_SECONDS = 30.0
-GOFREE_DATA_SILENCE_RECONNECT_SECONDS = 60.0
+GOFREE_DATA_SILENCE_RECONNECT_SECONDS = 90.0
+GOFREE_PROCESSOR_PING_INTERVAL_SECONDS = 30.0
+GOFREE_PROCESSOR_PING_TIMEOUT_SECONDS = 15.0
 CONFIG_POLL_SECONDS = 10.0
 CLAIM_POLL_SECONDS = 15.0
 IDLE_SLEEP_SECONDS = 1.0
@@ -364,6 +366,8 @@ class PiEdgeAgent:
         discovery_timeout: float,
         spool_max_payloads: int,
         data_silence_reconnect_seconds: float,
+        processor_ping_interval_seconds: float,
+        processor_ping_timeout_seconds: float,
     ) -> None:
         self.server_url = server_url.rstrip("/")
         self.state_dir = state_dir
@@ -374,6 +378,8 @@ class PiEdgeAgent:
         self.processor_host_override = processor_host.strip()
         self.discovery_timeout = discovery_timeout
         self.data_silence_reconnect_seconds = max(10.0, data_silence_reconnect_seconds)
+        self.processor_ping_interval_seconds = processor_ping_interval_seconds if processor_ping_interval_seconds > 0 else None
+        self.processor_ping_timeout_seconds = processor_ping_timeout_seconds if processor_ping_timeout_seconds > 0 else None
         self.data_info_by_metric_id: dict[int, dict[str, Any]] = {}
         self.setting_by_id: dict[int, dict[str, Any]] = {}
         self.stop_event = asyncio.Event()
@@ -559,6 +565,9 @@ class PiEdgeAgent:
                 "processor_enabled": self.processor_enabled,
                 "streaming_enabled": self.streaming_enabled,
                 "last_remote_command_at": self.last_remote_command_at or None,
+                "processor_ping_interval_seconds": self.processor_ping_interval_seconds,
+                "processor_ping_timeout_seconds": self.processor_ping_timeout_seconds,
+                "data_silence_reconnect_seconds": self.data_silence_reconnect_seconds,
             },
             "storage": {
                 "state_dir": disk_stats(self.state_dir),
@@ -761,7 +770,12 @@ class PiEdgeAgent:
         self.setting_by_id.clear()
         url = f"ws://{processor_host}:{processor_port}{processor_path or '/'}"
         LOGGER.info("Connecting to GoFree processor at %s", url)
-        async with websockets.connect(url, ping_interval=None, max_queue=1024) as websocket:
+        async with websockets.connect(
+            url,
+            ping_interval=self.processor_ping_interval_seconds,
+            ping_timeout=self.processor_ping_timeout_seconds,
+            max_queue=1024,
+        ) as websocket:
             await websocket.send(self.subscription_message())
             await self.request_metadata(websocket)
             last_metadata_request = time.monotonic()
@@ -894,6 +908,18 @@ def parse_args() -> argparse.Namespace:
         help="Reconnect the GoFree processor websocket if no telemetry Data messages arrive for this many seconds",
     )
     parser.add_argument(
+        "--processor-ping-interval-seconds",
+        type=float,
+        default=float(os.environ.get("MATADOR_PI_EDGE_PROCESSOR_PING_INTERVAL_SECONDS", str(GOFREE_PROCESSOR_PING_INTERVAL_SECONDS))),
+        help="Websocket ping interval for the local GoFree processor connection. Set to 0 to disable.",
+    )
+    parser.add_argument(
+        "--processor-ping-timeout-seconds",
+        type=float,
+        default=float(os.environ.get("MATADOR_PI_EDGE_PROCESSOR_PING_TIMEOUT_SECONDS", str(GOFREE_PROCESSOR_PING_TIMEOUT_SECONDS))),
+        help="Websocket ping timeout for the local GoFree processor connection. Set to 0 to disable.",
+    )
+    parser.add_argument(
         "--spool-max-payloads",
         "--queue-size",
         dest="spool_max_payloads",
@@ -928,6 +954,8 @@ def main() -> None:
         discovery_timeout=args.discovery_timeout,
         spool_max_payloads=args.spool_max_payloads,
         data_silence_reconnect_seconds=args.data_silence_reconnect_seconds,
+        processor_ping_interval_seconds=args.processor_ping_interval_seconds,
+        processor_ping_timeout_seconds=args.processor_ping_timeout_seconds,
     )
     try:
         asyncio.run(agent.run())
