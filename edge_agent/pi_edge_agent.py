@@ -233,6 +233,12 @@ def stable_claim_code(device_uid: str) -> str:
     return "-".join((compact + "00000000")[idx : idx + 4] for idx in (0, 4))
 
 
+def random_claim_code() -> str:
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    value = "".join(secrets.choice(alphabet) for _ in range(8))
+    return f"{value[:4]}-{value[4:]}"
+
+
 def int_or_none(value: Any) -> int | None:
     try:
         if value is None:
@@ -473,6 +479,11 @@ class PiEdgeAgent:
         self.save_state()
         return device_uid, claim_token, claim_code
 
+    def reset_claim_identity(self) -> None:
+        self.state["device_uid"] = str(uuid.uuid4())
+        self.state["claim_device_token"] = secrets.token_urlsafe(32)
+        self.state["claim_code"] = random_claim_code()
+
     def request_claim(self) -> dict[str, Any]:
         device_uid, claim_token, claim_code = self.claim_identity()
         LOGGER.info("Requesting Matador admin claim approval with claim code %s", claim_code)
@@ -696,6 +707,7 @@ class PiEdgeAgent:
                 acked = self.acknowledge_remote_command(requested_at)
                 for key in ("device_token", "config", "enrolled_at", "last_remote_command_at"):
                     self.state.pop(key, None)
+                self.reset_claim_identity()
                 self.current_config = {}
                 self.record_command_result(action, "ok", "Agent reset to claim mode; restarting.")
                 if acked:
