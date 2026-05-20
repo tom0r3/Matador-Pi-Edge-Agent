@@ -32,7 +32,10 @@ commands, health/storage telemetry, and no-code admin claiming.
   `/edge/stream` endpoint.
 - Stores unsent payloads in a durable SQLite spool at
   `/var/lib/matador-pi-edge-agent/outbound-spool.sqlite3`.
-- Keeps spooled payloads until Matador acknowledges them, then deletes them.
+- Uploads queued payloads in bounded batches so outage backlogs drain quickly
+  after internet service returns.
+- Keeps spooled payloads until Matador acknowledges the batch, then deletes
+  the acknowledged rows.
 - Reports Pi hostname, app version, load average, spool depth, spool size, and
   filesystem capacity in the upstream `pi_health` payload.
 - Polls Matador config every 10 seconds for remote commands.
@@ -81,6 +84,8 @@ MATADOR_PI_EDGE_SPOOL_MAX_PAYLOADS=50000
 MATADOR_PI_EDGE_PROCESSOR_PING_INTERVAL_SECONDS=30
 MATADOR_PI_EDGE_PROCESSOR_PING_TIMEOUT_SECONDS=15
 MATADOR_PI_EDGE_DATA_SILENCE_RECONNECT_SECONDS=90
+MATADOR_PI_EDGE_UPLOAD_BATCH_MAX_READINGS=250
+MATADOR_PI_EDGE_UPLOAD_BATCH_MAX_PAYLOADS=50
 MATADOR_PI_EDGE_LOG_LEVEL=INFO
 ```
 

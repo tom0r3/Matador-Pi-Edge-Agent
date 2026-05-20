@@ -30,6 +30,8 @@ GOFREE_DATA_INFO_REFRESH_SECONDS = 30.0
 GOFREE_DATA_SILENCE_RECONNECT_SECONDS = 90.0
 GOFREE_PROCESSOR_PING_INTERVAL_SECONDS = 30.0
 GOFREE_PROCESSOR_PING_TIMEOUT_SECONDS = 15.0
+UPLOAD_BATCH_MAX_READINGS = 250
+UPLOAD_BATCH_MAX_PAYLOADS = 50
 CONFIG_POLL_SECONDS = 10.0
 CLAIM_POLL_SECONDS = 15.0
 IDLE_SLEEP_SECONDS = 1.0
@@ -143,9 +145,36 @@ class PayloadSpool:
             return None
         return int(row[0]), json.loads(str(row[1]))
 
+    def peek_oldest_batch(self, max_payloads: int, max_readings: int) -> list[tuple[int, dict[str, Any]]]:
+        row_limit = max(1, max_payloads)
+        reading_limit = max(1, max_readings)
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id, payload_json FROM outbound_payloads ORDER BY id ASC LIMIT ?",
+                (row_limit,),
+            ).fetchall()
+        batch: list[tuple[int, dict[str, Any]]] = []
+        reading_count = 0
+        for row in rows:
+            payload = json.loads(str(row[1]))
+            data = payload.get("Data")
+            payload_readings = len(data) if isinstance(data, list) else 0
+            if batch and reading_count + payload_readings > reading_limit:
+                break
+            batch.append((int(row[0]), payload))
+            reading_count += payload_readings
+        return batch
+
     def ack(self, payload_id: int) -> None:
         with self._connect() as conn:
             conn.execute("DELETE FROM outbound_payloads WHERE id = ?", (payload_id,))
+
+    def ack_many(self, payload_ids: list[int]) -> None:
+        if not payload_ids:
+            return
+        placeholders = ",".join("?" for _ in payload_ids)
+        with self._connect() as conn:
+            conn.execute(f"DELETE FROM outbound_payloads WHERE id IN ({placeholders})", payload_ids)
 
     def clear(self) -> None:
         with self._connect() as conn:
@@ -203,6 +232,15 @@ def int_or_none(value: Any) -> int | None:
         if value is None:
             return None
         return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def float_or_none(value: Any) -> float | None:
+    try:
+        if value is None:
+            return None
+        return float(value)
     except (TypeError, ValueError):
         return None
 
@@ -368,6 +406,8 @@ class PiEdgeAgent:
         data_silence_reconnect_seconds: float,
         processor_ping_interval_seconds: float,
         processor_ping_timeout_seconds: float,
+        upload_batch_max_readings: int,
+        upload_batch_max_payloads: int,
     ) -> None:
         self.server_url = server_url.rstrip("/")
         self.state_dir = state_dir
@@ -380,6 +420,8 @@ class PiEdgeAgent:
         self.data_silence_reconnect_seconds = max(10.0, data_silence_reconnect_seconds)
         self.processor_ping_interval_seconds = processor_ping_interval_seconds if processor_ping_interval_seconds > 0 else None
         self.processor_ping_timeout_seconds = processor_ping_timeout_seconds if processor_ping_timeout_seconds > 0 else None
+        self.upload_batch_max_readings = max(1, min(500, upload_batch_max_readings))
+        self.upload_batch_max_payloads = max(1, upload_batch_max_payloads)
         self.data_info_by_metric_id: dict[int, dict[str, Any]] = {}
         self.setting_by_id: dict[int, dict[str, Any]] = {}
         self.stop_event = asyncio.Event()
@@ -568,6 +610,8 @@ class PiEdgeAgent:
                 "processor_ping_interval_seconds": self.processor_ping_interval_seconds,
                 "processor_ping_timeout_seconds": self.processor_ping_timeout_seconds,
                 "data_silence_reconnect_seconds": self.data_silence_reconnect_seconds,
+                "upload_batch_max_readings": self.upload_batch_max_readings,
+                "upload_batch_max_payloads": self.upload_batch_max_payloads,
             },
             "storage": {
                 "state_dir": disk_stats(self.state_dir),
@@ -848,6 +892,30 @@ class PiEdgeAgent:
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60.0)
 
+    def build_upload_payload(self, rows: list[tuple[int, dict[str, Any]]]) -> dict[str, Any]:
+        first_payload = dict(rows[0][1])
+        readings: list[dict[str, Any]] = []
+        queued_sent_at_values: list[float] = []
+        for _, payload in rows:
+            sent_at = float_or_none(payload.get("sent_at"))
+            if sent_at is not None:
+                queued_sent_at_values.append(sent_at)
+            data = payload.get("Data")
+            if not isinstance(data, list):
+                continue
+            readings.extend(item for item in data if isinstance(item, dict))
+
+        first_payload["Data"] = readings
+        first_payload["agent_kind"] = "pi_edge_agent"
+        first_payload["app_version"] = APP_VERSION
+        first_payload["payload_batch"] = {
+            "payload_count": len(rows),
+            "reading_count": len(readings),
+            "oldest_payload_sent_at": min(queued_sent_at_values) if queued_sent_at_values else None,
+            "newest_payload_sent_at": max(queued_sent_at_values) if queued_sent_at_values else None,
+        }
+        return first_payload
+
     async def stream_once(self) -> None:
         token = self.device_token
         if not token:
@@ -857,20 +925,27 @@ class PiEdgeAgent:
         async with websockets.connect(upstream_url, ping_interval=30, ping_timeout=30) as websocket:
             LOGGER.info("Upstream Matador stream connected")
             while not self.stop_event.is_set() and self.streaming_enabled:
-                row = await asyncio.to_thread(self.spool.peek_oldest)
-                if row is None:
+                rows = await asyncio.to_thread(
+                    self.spool.peek_oldest_batch,
+                    self.upload_batch_max_payloads,
+                    self.upload_batch_max_readings,
+                )
+                if not rows:
                     await asyncio.sleep(IDLE_SLEEP_SECONDS)
                     continue
-                payload_id, outgoing = row
+                payload_ids = [payload_id for payload_id, _ in rows]
+                outgoing = self.build_upload_payload(rows)
                 outgoing["pi_health"] = self.health_payload()
                 await websocket.send(json.dumps(outgoing, separators=(",", ":")))
-                response_text = await asyncio.wait_for(websocket.recv(), timeout=5)
+                response_text = await asyncio.wait_for(websocket.recv(), timeout=15)
                 response = json.loads(response_text)
                 if not response.get("ok", False):
-                    self.increment_counter("upstream_payloads_failed")
+                    self.increment_counter("upstream_payloads_failed", len(rows))
                     raise RuntimeError(str(response.get("error") or "Matador rejected Edge payload"))
-                await asyncio.to_thread(self.spool.ack, payload_id)
-                self.increment_counter("upstream_payloads_sent")
+                await asyncio.to_thread(self.spool.ack_many, payload_ids)
+                self.increment_counter("upstream_batches_sent")
+                self.increment_counter("upstream_payloads_sent", len(rows))
+                self.increment_counter("upstream_readings_sent", len(outgoing.get("Data") or []))
 
     async def run(self) -> None:
         await asyncio.to_thread(self.fetch_config)
@@ -920,6 +995,18 @@ def parse_args() -> argparse.Namespace:
         help="Websocket ping timeout for the local GoFree processor connection. Set to 0 to disable.",
     )
     parser.add_argument(
+        "--upload-batch-max-readings",
+        type=int,
+        default=int(os.environ.get("MATADOR_PI_EDGE_UPLOAD_BATCH_MAX_READINGS", str(UPLOAD_BATCH_MAX_READINGS))),
+        help="Maximum readings to send to Matador in one queued upload batch. Clamped to 500.",
+    )
+    parser.add_argument(
+        "--upload-batch-max-payloads",
+        type=int,
+        default=int(os.environ.get("MATADOR_PI_EDGE_UPLOAD_BATCH_MAX_PAYLOADS", str(UPLOAD_BATCH_MAX_PAYLOADS))),
+        help="Maximum queued SQLite payload rows to merge into one Matador upload batch.",
+    )
+    parser.add_argument(
         "--spool-max-payloads",
         "--queue-size",
         dest="spool_max_payloads",
@@ -956,6 +1043,8 @@ def main() -> None:
         data_silence_reconnect_seconds=args.data_silence_reconnect_seconds,
         processor_ping_interval_seconds=args.processor_ping_interval_seconds,
         processor_ping_timeout_seconds=args.processor_ping_timeout_seconds,
+        upload_batch_max_readings=args.upload_batch_max_readings,
+        upload_batch_max_payloads=args.upload_batch_max_payloads,
     )
     try:
         asyncio.run(agent.run())
