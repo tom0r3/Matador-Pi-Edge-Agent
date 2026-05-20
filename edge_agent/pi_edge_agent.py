@@ -633,6 +633,135 @@ class PiEdgeAgent:
             LOGGER.info("Command %s output: %s", " ".join(command), output)
         return result
 
+    def command_status(self, command: list[str], *, timeout: int = 8) -> dict[str, Any]:
+        try:
+            result = subprocess.run(command, text=True, capture_output=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return {"ok": False, "returncode": None, "detail": f"{' '.join(command)} timed out after {timeout}s"}
+        output = "\n".join(part.strip() for part in (result.stdout, result.stderr) if part and part.strip())
+        return {"ok": result.returncode == 0, "returncode": result.returncode, "detail": output}
+
+    def update_timer_state(self, *, force: bool = False) -> dict[str, Any]:
+        cached = self.state.get("update_timer_state")
+        cached_at = float_or_none(self.state.get("update_timer_state_checked_at"))
+        if not force and isinstance(cached, dict) and cached_at is not None and time.time() - cached_at < 60:
+            return cached
+        if os.name == "nt":
+            return {"available": False, "detail": "systemd timer state is only available on Linux agents"}
+        timer = "matador-pi-edge-update.timer"
+        service = "matador-pi-edge-update.service"
+        enabled = self.command_status(["systemctl", "is-enabled", timer], timeout=5)
+        active = self.command_status(["systemctl", "is-active", timer], timeout=5)
+        timer_show = self.command_status(
+            ["systemctl", "show", timer, "-p", "NextElapseUSecRealtime", "-p", "LastTriggerUSec", "-p", "UnitFileState"],
+            timeout=5,
+        )
+        service_show = self.command_status(
+            ["systemctl", "show", service, "-p", "Result", "-p", "ExecMainStatus", "-p", "ActiveState", "-p", "SubState"],
+            timeout=5,
+        )
+        details: dict[str, str] = {}
+        for output in (timer_show.get("detail"), service_show.get("detail")):
+            for line in str(output or "").splitlines():
+                if "=" in line:
+                    key, value = line.split("=", 1)
+                    details[key] = value
+        state = {
+            "available": True,
+            "enabled": str(enabled.get("detail") or "").strip() or "unknown",
+            "active": str(active.get("detail") or "").strip() or "unknown",
+            "next_run": details.get("NextElapseUSecRealtime") or None,
+            "last_trigger": details.get("LastTriggerUSec") or None,
+            "unit_file_state": details.get("UnitFileState") or None,
+            "last_result": details.get("Result") or None,
+            "service_state": details.get("ActiveState") or None,
+            "service_substate": details.get("SubState") or None,
+            "service_exit_status": details.get("ExecMainStatus") or None,
+            "ok": enabled.get("ok") and active.get("ok"),
+            "detail": enabled.get("detail") if not enabled.get("ok") else active.get("detail") if not active.get("ok") else "",
+        }
+        self.state["update_timer_state"] = state
+        self.state["update_timer_state_checked_at"] = time.time()
+        return state
+
+    def record_upload_progress(self, payload_count: int, reading_count: int) -> None:
+        now = time.time()
+        previous = float_or_none(self.state.get("upload_rate_sample_time"))
+        if previous is not None:
+            elapsed = max(0.001, now - previous)
+            payload_rate = max(0.0, payload_count / elapsed)
+            reading_rate = max(0.0, reading_count / elapsed)
+            old_payload_rate = float_or_none(self.state.get("upload_rate_payloads_per_second"))
+            old_reading_rate = float_or_none(self.state.get("upload_rate_readings_per_second"))
+            self.state["upload_rate_payloads_per_second"] = (
+                payload_rate if old_payload_rate is None else (old_payload_rate * 0.75) + (payload_rate * 0.25)
+            )
+            self.state["upload_rate_readings_per_second"] = (
+                reading_rate if old_reading_rate is None else (old_reading_rate * 0.75) + (reading_rate * 0.25)
+            )
+        self.state["upload_rate_sample_time"] = now
+
+    def run_self_test(self) -> dict[str, Any]:
+        generated_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        checks: list[dict[str, Any]] = []
+
+        def add(name: str, status: str, detail: str = "", extra: dict[str, Any] | None = None) -> None:
+            checks.append({"name": name, "status": status, "detail": detail, **(extra or {})})
+
+        state_stats = disk_stats(self.state_dir)
+        free_bytes = int(state_stats.get("free_bytes") or 0)
+        add("State directory", "pass" if free_bytes > 100 * 1024 * 1024 else "warn", f"{int(free_bytes / 1024 / 1024)} MB free", state_stats)
+
+        try:
+            spool_stats = self.spool.stats()
+            add("Queue database", "pass", f"{spool_stats.get('pending_payloads', 0)} pending payloads", spool_stats)
+        except Exception as exc:
+            add("Queue database", "fail", str(exc))
+
+        server_version = (self.config() or {}).get("server_version")
+        update_available = bool(server_version and server_version != APP_VERSION)
+        add(
+            "Agent version",
+            "warn" if update_available else "pass",
+            f"local {APP_VERSION}; server {server_version or 'unknown'}",
+            {"update_available": update_available},
+        )
+
+        timer = self.update_timer_state(force=True)
+        add(
+            "Update timer",
+            "pass" if timer.get("ok") else "warn",
+            f"enabled={timer.get('enabled')}; active={timer.get('active')}; result={timer.get('last_result') or 'unknown'}",
+            timer,
+        )
+
+        sudo_check = self.command_status(["sudo", "-n", "true"], timeout=5) if os.name != "nt" else {"ok": False, "detail": "not Linux"}
+        add("Maintenance sudo", "pass" if sudo_check.get("ok") else "fail", str(sudo_check.get("detail") or "sudo preflight ok"))
+
+        try:
+            devices = discover_gofree_devices(min(self.discovery_timeout, 4.0))
+            lock = self.locked_processor_identity()
+            lock_match = any(device_matches_identity(device, lock) for device in devices) if lock else None
+            status = "pass" if devices and (lock_match is not False) else "warn" if devices else "fail"
+            detail = f"{len(devices)} processor(s) discovered"
+            if lock:
+                detail = f"{detail}; lock match={'yes' if lock_match else 'no'}"
+            add("GoFree discovery", status, detail, {"processors": [device.identity() for device in devices]})
+        except Exception as exc:
+            add("GoFree discovery", "fail", str(exc))
+
+        last_processor_data_at = self.state.get("last_processor_data_at")
+        add("GoFree telemetry", "pass" if last_processor_data_at else "warn", f"last data {last_processor_data_at or 'never'}")
+        last_upload_at = self.state.get("last_upload_at")
+        add("Matador upload", "pass" if last_upload_at else "warn", f"last upload {last_upload_at or 'never'}")
+
+        severity = {"fail": 2, "warn": 1, "pass": 0}
+        worst = max((severity.get(check["status"], 1) for check in checks), default=0)
+        summary = "fail" if worst >= 2 else "warn" if worst == 1 else "pass"
+        report = {"generated_at": generated_at, "summary": summary, "checks": checks}
+        self.state["last_self_test"] = report
+        return report
+
     def run_background_update(self) -> None:
         script = Path(__file__).resolve().parents[1] / "scripts" / "update.sh"
         if not script.exists():
@@ -695,6 +824,8 @@ class PiEdgeAgent:
                 self.spool.clear()
             elif action == "support_bundle":
                 self.state["last_support_bundle"] = self.support_bundle()
+            elif action == "self_test":
+                self.run_self_test()
             elif action == "set_hostname":
                 self.set_system_hostname(argument)
             elif action == "update_agent":
@@ -737,13 +868,17 @@ class PiEdgeAgent:
         if self.acknowledge_remote_command(requested_at):
             self.last_remote_command_at = requested_at
             self.state["last_remote_command_at"] = requested_at
+        self.save_state()
 
     def health_payload(self, *, include_support_bundle: bool = True) -> dict[str, Any]:
         spool_stats = self.spool.stats()
         processor_queued = int(self.counters.get("processor_payloads_queued") or 0)
         pending = int(spool_stats.get("pending_payloads") or 0)
+        upload_rate = float_or_none(self.state.get("upload_rate_payloads_per_second"))
+        queue_eta_seconds = (pending / upload_rate) if pending and upload_rate and upload_rate > 0 else None
         lock = self.locked_processor_identity()
         serial = normalized_serial_number((lock or {}).get("serial_number")) if lock else ""
+        server_version = (self.config() or {}).get("server_version")
         lock_confidence = (
             "serial"
             if serial
@@ -759,7 +894,8 @@ class PiEdgeAgent:
                 "name": APP_NAME,
                 "version": APP_VERSION,
                 "hostname": hostname(),
-                "latest_server_version": (self.config() or {}).get("server_version"),
+                "latest_server_version": server_version,
+                "update_available": bool(server_version and server_version != APP_VERSION),
             },
             "controls": {
                 "processor_enabled": self.processor_enabled,
@@ -778,9 +914,13 @@ class PiEdgeAgent:
                     **spool_stats,
                     "estimated_delivered_payloads": max(0, processor_queued - pending),
                     "oldest_pending_message_age_seconds": spool_stats.get("oldest_payload_age_seconds"),
+                    "upload_rate_payloads_per_second": upload_rate,
+                    "upload_rate_readings_per_second": float_or_none(self.state.get("upload_rate_readings_per_second")),
+                    "estimated_drain_eta_seconds": queue_eta_seconds,
                 },
             },
             "system": load_average(),
+            "update_timer": self.update_timer_state(),
             "counters": self.counters,
             "links": {
                 "last_config_at": self.state.get("last_config_at") or None,
@@ -795,6 +935,7 @@ class PiEdgeAgent:
             "lock_confidence": lock_confidence,
             "current_processor_identity": self.current_processor_identity or None,
             "last_processor_host": self.state.get("last_processor_host") or None,
+            "self_test": self.state.get("last_self_test") or None,
         }
         if include_support_bundle:
             payload["support_bundle"] = self.state.get("last_support_bundle") or None
@@ -1177,6 +1318,7 @@ class PiEdgeAgent:
                 self.increment_counter("upstream_batches_sent")
                 self.increment_counter("upstream_payloads_sent", len(rows))
                 self.increment_counter("upstream_readings_sent", len(outgoing.get("Data") or []))
+                self.record_upload_progress(len(rows), len(outgoing.get("Data") or []))
                 self.state["last_upload_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
                 self.save_state()
 
