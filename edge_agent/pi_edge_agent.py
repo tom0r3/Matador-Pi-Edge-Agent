@@ -182,12 +182,15 @@ class PayloadSpool:
 
     def stats(self) -> dict[str, Any]:
         with self._connect() as conn:
-            row = conn.execute("SELECT count(*), min(created_at), max(created_at) FROM outbound_payloads").fetchone()
+            row = conn.execute(
+                "SELECT count(*), min(created_at), max(created_at), coalesce(sum(length(payload_json)), 0) FROM outbound_payloads"
+            ).fetchone()
         count = int(row[0] or 0)
         return {
             "pending_payloads": count,
             "oldest_payload_age_seconds": max(0.0, time.time() - float(row[1])) if row[1] else None,
             "newest_payload_age_seconds": max(0.0, time.time() - float(row[2])) if row[2] else None,
+            "queued_payload_bytes": int(row[3] or 0),
             "spool_bytes": self.path.stat().st_size if self.path.exists() else 0,
             "spool_max_payloads": self.max_rows,
         }

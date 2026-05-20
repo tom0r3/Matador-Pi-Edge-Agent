@@ -38,6 +38,8 @@ commands, health/storage telemetry, and no-code admin claiming.
   the acknowledged rows.
 - Reports Pi hostname, app version, load average, spool depth, spool size, and
   filesystem capacity in the upstream `pi_health` payload.
+- Separates active queued payload bytes from SQLite spool file size, since the
+  database file may remain large after a backlog has drained.
 - Polls Matador config every 10 seconds for remote commands.
 - Supports existing Edge remote command actions:
   `connect_processor`, `start_streaming`, and `stop_streaming`.
