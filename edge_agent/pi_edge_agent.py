@@ -9,6 +9,7 @@ import secrets
 import shutil
 import socket
 import sqlite3
+import subprocess
 import time
 import urllib.error
 import urllib.request
@@ -439,9 +440,11 @@ class PiEdgeAgent:
         self.current_config: dict[str, Any] = {}
         self.processor_enabled = bool(self.state.get("processor_enabled", True))
         self.streaming_enabled = bool(self.state.get("streaming_enabled", True))
+        self.upload_paused = bool(self.state.get("upload_paused", False))
         self.last_remote_command_at = str(self.state.get("last_remote_command_at") or "")
         self.counters = dict(self.state.get("counters") or {})
         self.current_processor_identity = dict(self.state.get("current_processor_identity") or {})
+        self.processor_reconnect_requested = False
 
     def increment_counter(self, name: str, amount: int = 1) -> None:
         self.counters[name] = int(self.counters.get(name) or 0) + amount
@@ -578,46 +581,157 @@ class PiEdgeAgent:
             LOGGER.warning("Failed to acknowledge remote command: %s", exc)
             return False
 
+    def record_command_result(self, action: str, status: str, detail: str = "") -> None:
+        self.state["last_command_result"] = {
+            "action": action,
+            "status": status,
+            "detail": detail,
+            "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+
+    def support_bundle(self) -> str:
+        safe_state = {key: value for key, value in self.state.items() if key not in {"device_token", "claim_device_token", "config"}}
+        return json.dumps(
+            {
+                "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "agent": {"name": APP_NAME, "version": APP_VERSION, "hostname": hostname()},
+                "health": self.health_payload(include_support_bundle=False),
+                "state": safe_state,
+            },
+            indent=2,
+            sort_keys=True,
+            default=str,
+        )
+
+    def run_background_update(self) -> None:
+        script = Path(__file__).resolve().parents[1] / "scripts" / "update.sh"
+        if not script.exists():
+            raise RuntimeError(f"Update script not found: {script}")
+        command = ["sudo", "-n", str(script)] if os.name != "nt" else [str(script)]
+        subprocess.Popen(command, cwd=str(script.parents[1]), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def set_auto_update_timer(self, enabled: bool) -> None:
+        if os.name == "nt":
+            raise RuntimeError("Auto-update timer control is only supported on Raspberry Pi/Linux agents")
+        action = "enable" if enabled else "disable"
+        command = ["sudo", "-n", "systemctl", action]
+        if enabled:
+            command.append("--now")
+        else:
+            command.append("--now")
+        command.append("matador-pi-edge-update.timer")
+        subprocess.run(command, check=True, timeout=20)
+
+    def set_system_hostname(self, requested_hostname: str) -> None:
+        cleaned = "".join(ch for ch in requested_hostname.strip().lower() if ch.isalnum() or ch == "-").strip("-")
+        if not cleaned or len(cleaned) > 63:
+            raise RuntimeError("Hostname must contain letters, numbers, or hyphens and be 1-63 characters")
+        if os.name == "nt":
+            raise RuntimeError("Hostname changes are only supported on Raspberry Pi/Linux agents")
+        subprocess.run(["sudo", "-n", "hostnamectl", "set-hostname", cleaned], check=True, timeout=15)
+        self.state["requested_hostname"] = cleaned
+
     def handle_remote_command(self, command: dict[str, Any]) -> None:
-        action = str(command.get("action") or "").strip()
+        raw_action = str(command.get("action") or "").strip()
+        action, _, argument = raw_action.partition("|")
+        action = action.strip()
+        argument = argument.strip()
         requested_at = str(command.get("requested_at") or "").strip()
         if not action or not requested_at or requested_at == self.last_remote_command_at:
             return
         LOGGER.info("Applying remote command %s requested at %s", action, requested_at)
-        if action == "connect_processor":
-            self.processor_enabled = True
-        elif action == "start_streaming":
-            self.processor_enabled = True
-            self.streaming_enabled = True
-        elif action == "stop_streaming":
-            self.streaming_enabled = False
-        elif action == "clear_queue":
-            self.spool.clear()
-        elif action == "restart_agent":
-            self.acknowledge_remote_command(requested_at)
-            self.last_remote_command_at = requested_at
-            self.state["last_remote_command_at"] = requested_at
-            self.save_state()
-            raise RestartRequested("Restart requested by Matador admin")
-        else:
-            LOGGER.warning("Ignoring unknown remote command: %s", action)
+        try:
+            if action == "connect_processor":
+                self.processor_enabled = True
+            elif action == "reconnect_processor":
+                self.processor_enabled = True
+                self.processor_reconnect_requested = True
+            elif action == "refresh_discovery":
+                self.processor_reconnect_requested = True
+            elif action == "start_streaming":
+                self.processor_enabled = True
+                self.streaming_enabled = True
+                self.upload_paused = False
+            elif action == "stop_streaming":
+                self.streaming_enabled = False
+            elif action == "pause_uploads":
+                self.upload_paused = True
+            elif action == "resume_uploads":
+                self.upload_paused = False
+                self.streaming_enabled = True
+            elif action == "clear_queue":
+                self.spool.clear()
+            elif action == "support_bundle":
+                self.state["last_support_bundle"] = self.support_bundle()
+            elif action == "set_hostname":
+                self.set_system_hostname(argument)
+            elif action == "update_agent":
+                self.run_background_update()
+            elif action == "enable_auto_update":
+                self.set_auto_update_timer(True)
+            elif action == "disable_auto_update":
+                self.set_auto_update_timer(False)
+            elif action == "reset_agent":
+                acked = self.acknowledge_remote_command(requested_at)
+                for key in ("device_token", "config", "enrolled_at", "last_remote_command_at"):
+                    self.state.pop(key, None)
+                self.current_config = {}
+                self.record_command_result(action, "ok", "Agent reset to claim mode; restarting.")
+                if acked:
+                    self.state["last_remote_command_at"] = requested_at
+                self.save_state()
+                raise RestartRequested("Reset to claim mode requested by Matador admin")
+            elif action == "restart_agent":
+                self.record_command_result(action, "ok", "Restart requested by Matador admin")
+                self.acknowledge_remote_command(requested_at)
+                self.last_remote_command_at = requested_at
+                self.state["last_remote_command_at"] = requested_at
+                self.save_state()
+                raise RestartRequested("Restart requested by Matador admin")
+            else:
+                LOGGER.warning("Ignoring unknown remote command: %s", action)
+                self.record_command_result(action, "ignored", "Unknown remote command")
+                return
+            self.record_command_result(action, "ok", "Command applied")
+        except RestartRequested:
+            raise
+        except Exception as exc:
+            LOGGER.warning("Remote command %s failed: %s", action, exc)
+            self.record_command_result(action, "error", str(exc))
         self.state["processor_enabled"] = self.processor_enabled
         self.state["streaming_enabled"] = self.streaming_enabled
+        self.state["upload_paused"] = self.upload_paused
         if self.acknowledge_remote_command(requested_at):
             self.last_remote_command_at = requested_at
             self.state["last_remote_command_at"] = requested_at
 
-    def health_payload(self) -> dict[str, Any]:
-        return {
+    def health_payload(self, *, include_support_bundle: bool = True) -> dict[str, Any]:
+        spool_stats = self.spool.stats()
+        processor_queued = int(self.counters.get("processor_payloads_queued") or 0)
+        pending = int(spool_stats.get("pending_payloads") or 0)
+        lock = self.locked_processor_identity()
+        serial = normalized_serial_number((lock or {}).get("serial_number")) if lock else ""
+        lock_confidence = (
+            "serial"
+            if serial
+            else "identity"
+            if lock and (lock.get("name") or lock.get("model"))
+            else "host"
+            if lock and lock.get("last_host")
+            else "none"
+        )
+        payload = {
             "agent": {
                 "kind": "pi_edge_agent",
                 "name": APP_NAME,
                 "version": APP_VERSION,
                 "hostname": hostname(),
+                "latest_server_version": (self.config() or {}).get("server_version"),
             },
             "controls": {
                 "processor_enabled": self.processor_enabled,
                 "streaming_enabled": self.streaming_enabled,
+                "upload_paused": self.upload_paused,
                 "last_remote_command_at": self.last_remote_command_at or None,
                 "processor_ping_interval_seconds": self.processor_ping_interval_seconds,
                 "processor_ping_timeout_seconds": self.processor_ping_timeout_seconds,
@@ -627,16 +741,31 @@ class PiEdgeAgent:
             },
             "storage": {
                 "state_dir": disk_stats(self.state_dir),
-                "spool": self.spool.stats(),
+                "spool": {
+                    **spool_stats,
+                    "estimated_delivered_payloads": max(0, processor_queued - pending),
+                    "oldest_pending_message_age_seconds": spool_stats.get("oldest_payload_age_seconds"),
+                },
             },
             "system": load_average(),
             "counters": self.counters,
+            "links": {
+                "last_config_at": self.state.get("last_config_at") or None,
+                "last_processor_data_at": self.state.get("last_processor_data_at") or None,
+                "last_upstream_connected_at": self.state.get("last_upstream_connected_at") or None,
+                "last_upload_at": self.state.get("last_upload_at") or None,
+            },
+            "command": self.state.get("last_command_result") or None,
             "last_discovered_device": self.state.get("last_discovered_device") or None,
             "last_discovered_processors": self.state.get("last_discovered_processors") or [],
-            "locked_processor_identity": self.locked_processor_identity(),
+            "locked_processor_identity": lock,
+            "lock_confidence": lock_confidence,
             "current_processor_identity": self.current_processor_identity or None,
             "last_processor_host": self.state.get("last_processor_host") or None,
         }
+        if include_support_bundle:
+            payload["support_bundle"] = self.state.get("last_support_bundle") or None
+        return payload
 
     def config(self) -> dict[str, Any]:
         return self.current_config or self.state.get("config") or {}
@@ -889,6 +1018,9 @@ class PiEdgeAgent:
             self.save_state()
             LOGGER.info("Subscribed to %s GoFree metrics", len(self.subscription_metrics()))
             while not self.stop_event.is_set() and self.processor_enabled:
+                if self.processor_reconnect_requested:
+                    self.processor_reconnect_requested = False
+                    raise RuntimeError("Processor reconnect requested by Matador admin")
                 if time.monotonic() - last_data_received >= self.data_silence_reconnect_seconds:
                     LOGGER.warning(
                         "No GoFree telemetry received for %.0fs; reconnecting processor websocket",
@@ -910,6 +1042,7 @@ class PiEdgeAgent:
                 if not isinstance(values, list) or not values:
                     continue
                 last_data_received = time.monotonic()
+                self.state["last_processor_data_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
                 self.increment_counter("processor_messages_received")
                 outgoing = {
                     "agent_kind": "pi_edge_agent",
@@ -933,7 +1066,7 @@ class PiEdgeAgent:
         while not self.stop_event.is_set():
             try:
                 await asyncio.to_thread(self.fetch_config)
-                if not self.streaming_enabled:
+                if not self.streaming_enabled or self.upload_paused:
                     await asyncio.sleep(IDLE_SLEEP_SECONDS)
                     continue
                 await self.stream_once()
@@ -986,7 +1119,10 @@ class PiEdgeAgent:
         LOGGER.info("Connecting upstream to %s", upstream_url.split("?token=", 1)[0])
         async with websockets.connect(upstream_url, ping_interval=30, ping_timeout=30) as websocket:
             LOGGER.info("Upstream Matador stream connected")
+            self.state["last_upstream_connected_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             while not self.stop_event.is_set() and self.streaming_enabled:
+                if self.upload_paused:
+                    return
                 rows = await asyncio.to_thread(
                     self.spool.peek_oldest_batch,
                     self.upload_batch_max_payloads,
@@ -1008,6 +1144,8 @@ class PiEdgeAgent:
                 self.increment_counter("upstream_batches_sent")
                 self.increment_counter("upstream_payloads_sent", len(rows))
                 self.increment_counter("upstream_readings_sent", len(outgoing.get("Data") or []))
+                self.state["last_upload_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                self.save_state()
 
     async def run(self) -> None:
         await asyncio.to_thread(self.fetch_config)
