@@ -24,6 +24,26 @@ python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 chmod +x scripts/*.sh
 
+APP_USER="${MATADOR_PI_EDGE_USER:-matador-edge}"
+SYSTEMCTL_BIN="$(command -v systemctl)"
+HOSTNAMECTL_BIN="$(command -v hostnamectl)"
+TRUE_BIN="$(command -v true)"
+case "$TRUE_BIN" in
+  /*) ;;
+  *) TRUE_BIN="/usr/bin/true" ;;
+esac
+SUDOERS_FILE="/etc/sudoers.d/matador-pi-edge-agent"
+cat > "${SUDOERS_FILE}.tmp" <<EOF
+$APP_USER ALL=(root) NOPASSWD: $TRUE_BIN
+$APP_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN enable --now matador-pi-edge-update.timer
+$APP_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN disable --now matador-pi-edge-update.timer
+$APP_USER ALL=(root) NOPASSWD: $HOSTNAMECTL_BIN set-hostname *
+$APP_USER ALL=(root) NOPASSWD: $APP_DIR/scripts/update.sh
+EOF
+chmod 0440 "${SUDOERS_FILE}.tmp"
+visudo -cf "${SUDOERS_FILE}.tmp"
+mv "${SUDOERS_FILE}.tmp" "$SUDOERS_FILE"
+
 cp "deploy/$SERVICE_NAME" "/etc/systemd/system/$SERVICE_NAME"
 cp deploy/matador-pi-edge-update.service /etc/systemd/system/matador-pi-edge-update.service
 cp deploy/matador-pi-edge-update.timer /etc/systemd/system/matador-pi-edge-update.timer

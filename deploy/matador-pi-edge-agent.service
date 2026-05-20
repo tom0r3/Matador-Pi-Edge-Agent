@@ -13,7 +13,6 @@ ExecStart=/opt/matador-pi-edge-agent/.venv/bin/python -m edge_agent.pi_edge_agen
 Restart=always
 RestartSec=5
 StateDirectory=matador-pi-edge-agent
-NoNewPrivileges=true
 PrivateTmp=true
 
 [Install]
