@@ -7,6 +7,7 @@ APP_USER="${MATADOR_PI_EDGE_USER:-matador-edge}"
 REPO_URL="${MATADOR_PI_EDGE_REPO_URL:-https://github.com/tom0r3/Matador-Pi-Edge-Agent.git}"
 SERVICE_NAME="matador-pi-edge-agent.service"
 START_NOW="${MATADOR_PI_EDGE_START_NOW:-1}"
+TARGET_HOSTNAME="${MATADOR_PI_EDGE_HOSTNAME:-matador-pi-edge}"
 
 if [ "$(id -u)" -ne 0 ]; then
   echo "Please run as root, for example: sudo ./scripts/install.sh" >&2
@@ -63,7 +64,12 @@ if [ "$START_NOW" = "0" ] || [ "$START_NOW" = "false" ] || [ "$START_NOW" = "no"
   install -d -o "$APP_USER" -g "$APP_USER" -m 0750 "$STATE_DIR"
   touch "$STATE_DIR/golden-image-hostname.pending"
   chown "$APP_USER:$APP_USER" "$STATE_DIR/golden-image-hostname.pending"
-  hostnamectl set-hostname matador-pi-edge
+  hostnamectl set-hostname "$TARGET_HOSTNAME"
+  if grep -q "^127.0.1.1" /etc/hosts; then
+    sed -i "s/^127.0.1.1.*/127.0.1.1\t$TARGET_HOSTNAME/" /etc/hosts
+  else
+    printf "127.0.1.1\t%s\n" "$TARGET_HOSTNAME" >> /etc/hosts
+  fi
   systemctl enable "$SERVICE_NAME"
   systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
   START_MESSAGE="Service is enabled for the customer's first boot, but was not started during install."

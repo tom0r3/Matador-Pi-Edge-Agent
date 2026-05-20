@@ -25,6 +25,9 @@ All notable project changes will be recorded here.
 - Preserved pending Pi Edge approval form selections across live Admin refreshes so only claim statistics/activity update while admins are choosing teams, roles, names, and lock targets.
 - Hardened Pi Edge golden-image hostname generation with a first-boot marker, hardware-first suffixes, and stale generated-hostname detection so cloned SD cards do not keep the source Pi hostname.
 - Fixed the Pi Edge first-boot hostname path by importing the hashing library used to derive hardware-based hostname suffixes.
+- Changed Pi Edge claim handling so a new pending claim from the same hostname supersedes older pending claim records, preventing duplicate approval cards after reset/golden-image preparation.
+- Added local Pi Edge `factory-reset.sh` and `prepare-golden-image.sh` wrappers, and made production-prep installs update `/etc/hosts` alongside the reset hostname.
+
 ## 2026-05-17 - Version 3.5.1
 
 - Added first-pass Windows Edge Agent `Expedition TCP` source support. The
