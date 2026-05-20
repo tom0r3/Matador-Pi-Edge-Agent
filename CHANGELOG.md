@@ -6,12 +6,25 @@ All notable project changes will be recorded here.
 
 ## 2026-05-19 - Version 3.5.2
 
-- Added an initial native SwiftUI iOS dashboard prototype under `ios/MatadorDashboard`, including login, role/team context, fleet summary, MapKit preview, forecast cards, and processor cards.
 - Added the Stage 3 Pi Edge Agent no-code claiming path: unconfigured Pi agents can phone home with a stable claim code, appear in the Admin page, and be approved into a team/processor without typing an enrolment code on the device.
 - Added a Pi Edge activity timeline to the Admin pending-claims panel so admins can see phone-home, waiting, approval, rejection, and config-pickup events without opening service logs.
 - Added a Pi Edge Agent GoFree telemetry-silence watchdog so an established but silent processor websocket is reconnected automatically instead of leaving the dashboard stale.
 - Hardened Pi Edge Agent state-file writes with unique temporary filenames to avoid concurrent `state.json.tmp` save races between config, claim, and processor loops.
-
+- Added Pi Edge Agent install and update scripts for GitHub-based appliance deployment and one-command field updates.
+- Added a root `VERSION` file and wired Pi Edge Agent plus Edge ingest version reporting to it so future release bumps are consistent.
+- Added Pi health counters and discovered-processor reporting so Admin/support can see queue activity, processor candidates, and message-flow counters.
+- Added Pi support/update tooling with `scripts/status.sh` plus optional `matador-pi-edge-update` systemd service/timer deployment files.
+- Cleaned up the Pi Edge Agent remote restart command so admin-triggered restarts exit intentionally without noisy asyncio traceback logs.
+- Changed Pi Edge Agent backlog uploads to drain the durable message queue in bounded batches instead of one SQLite payload per upstream acknowledgement.
+- Fixed Admin Pi Edge message-queue sizing so it displays active queued payload bytes instead of the SQLite spool file allocation, which can stay large after a backlog drains.
+- Added H5000/v1 Pi Edge processor identity handling by ignoring discovery serial `0`, reading barcode serial setting `89`, and backfilling the Edge processor lock when the real serial is available.
+- Updated Pi Edge install/update scripts to provision a narrow sudoers rule for remote maintenance commands and removed service hardening that blocked those sudo-backed controls.
+- Added Pi Edge self-test reporting, update timer state, update-available badges, and queue drain-rate/ETA telemetry to the Pi Edge Support page.
+- Added `MATADOR_PI_EDGE_START_NOW=0` production-prep install mode so new Pis can be provisioned without phoning home until the customer first boots them.
+- Added first-boot hostname uniquing for golden-image Pi clones, using a generic production-prep hostname that becomes `matador-pi-edge-xxxxxx` on first customer boot.
+- Preserved pending Pi Edge approval form selections across live Admin refreshes so only claim statistics/activity update while admins are choosing teams, roles, names, and lock targets.
+- Hardened Pi Edge golden-image hostname generation with a first-boot marker, hardware-first suffixes, and stale generated-hostname detection so cloned SD cards do not keep the source Pi hostname.
+- Fixed the Pi Edge first-boot hostname path by importing the hashing library used to derive hardware-based hostname suffixes.
 ## 2026-05-17 - Version 3.5.1
 
 - Added first-pass Windows Edge Agent `Expedition TCP` source support. The

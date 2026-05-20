@@ -1,6 +1,6 @@
 # Matador
 
-Current release: `Version 3.5.0`
+Current release: `Version 3.5.2`
 
 `Version 3` introduces mixed telemetry-source collection. Matador can now model
 both B&G GoFree websocket processors and NMEA0183 feeds as active telemetry
