@@ -28,13 +28,12 @@ exec > >(tee "$LOG_FILE") 2>&1
 echo "Update started at $(date -Is)"
 
 cd "$APP_DIR"
-git config --global --add safe.directory "$APP_DIR" || true
 
 # Pi appliances are field devices, not development checkouts. Force the local
 # tree to the release branch so root-owned edits, chmod drift, or interrupted
 # manual fixes do not permanently block remote updates.
-git fetch --prune origin "$GIT_BRANCH"
-git reset --hard "origin/$GIT_BRANCH"
+git -c "safe.directory=$APP_DIR" fetch --prune origin "$GIT_BRANCH"
+git -c "safe.directory=$APP_DIR" reset --hard "origin/$GIT_BRANCH"
 
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt

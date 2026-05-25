@@ -24,7 +24,8 @@ if ! id "$APP_USER" >/dev/null 2>&1; then
 fi
 
 if [ -d "$APP_DIR/.git" ]; then
-  git -C "$APP_DIR" pull --ff-only
+  git -c "safe.directory=$APP_DIR" -C "$APP_DIR" fetch --prune origin main
+  git -c "safe.directory=$APP_DIR" -C "$APP_DIR" reset --hard origin/main
 else
   rm -rf "$APP_DIR"
   git clone "$REPO_URL" "$APP_DIR"
