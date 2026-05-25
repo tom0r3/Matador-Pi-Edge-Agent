@@ -613,7 +613,7 @@ class PiEdgeAgent:
     def fetch_config(self) -> dict[str, Any]:
         self.enroll_if_needed()
         try:
-            response = request_json(self.server_url, "/edge/config", token=self.device_token)
+            response = self.request_config()
         except urllib.error.HTTPError as exc:
             if exc.code in (401, 403) and not self.enrollment_code:
                 LOGGER.warning("Stored Matador token was rejected; clearing token and entering Pi claim mode")
@@ -621,7 +621,7 @@ class PiEdgeAgent:
                 self.state.pop("config", None)
                 self.save_state()
                 self.claim_until_approved()
-                response = request_json(self.server_url, "/edge/config", token=self.device_token)
+                response = self.request_config()
             else:
                 raise
         self.state["config"] = response
@@ -630,6 +630,21 @@ class PiEdgeAgent:
         self.handle_remote_command(response.get("command") or {})
         self.save_state()
         return response
+
+    def request_config(self) -> dict[str, Any]:
+        payload = {
+            "agent_kind": "pi_edge_agent",
+            "app_version": APP_VERSION,
+            "client_hostname": hostname(),
+            "local_processor_host": self.state.get("last_processor_host") or self.processor_host_override or None,
+            "pi_health": self.health_payload(),
+        }
+        try:
+            return request_json(self.server_url, "/edge/config", payload, token=self.device_token)
+        except urllib.error.HTTPError as exc:
+            if exc.code in (404, 405):
+                return request_json(self.server_url, "/edge/config", token=self.device_token)
+            raise
 
     def acknowledge_remote_command(self, requested_at: str | None) -> bool:
         if not requested_at:
