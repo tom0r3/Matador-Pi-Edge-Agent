@@ -3,6 +3,7 @@ set -euo pipefail
 
 APP_DIR="${MATADOR_PI_EDGE_APP_DIR:-/opt/matador-pi-edge-agent}"
 STATE_DIR="${MATADOR_PI_EDGE_STATE_DIR:-/var/lib/matador-pi-edge-agent}"
+APP_USER="${MATADOR_PI_EDGE_USER:-matador-edge}"
 SERVICE_NAME="matador-pi-edge-agent.service"
 LOG_FILE="$STATE_DIR/update.log"
 GIT_BRANCH="${MATADOR_PI_EDGE_GIT_BRANCH:-main}"
@@ -39,7 +40,6 @@ python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 chmod +x scripts/*.sh
 
-APP_USER="${MATADOR_PI_EDGE_USER:-matador-edge}"
 SYSTEMCTL_BIN="$(command -v systemctl)"
 HOSTNAMECTL_BIN="$(command -v hostnamectl)"
 TRUE_BIN="$(command -v true)"
@@ -50,6 +50,8 @@ esac
 SUDOERS_FILE="/etc/sudoers.d/matador-pi-edge-agent"
 cat > "${SUDOERS_FILE}.tmp" <<EOF
 $APP_USER ALL=(root) NOPASSWD: $TRUE_BIN
+$APP_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN --no-block start matador-pi-edge-update.service
+$APP_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN start matador-pi-edge-update.service
 $APP_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN enable --now matador-pi-edge-update.timer
 $APP_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN disable --now matador-pi-edge-update.timer
 $APP_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN reboot

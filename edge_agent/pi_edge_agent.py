@@ -846,11 +846,12 @@ class PiEdgeAgent:
         script = Path(__file__).resolve().parents[1] / "scripts" / "update.sh"
         if not script.exists():
             raise RuntimeError(f"Update script not found: {script}")
-        command = ["sudo", "-n", str(script)] if os.name != "nt" else [str(script)]
+        self.state["last_update_requested_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         if os.name != "nt":
             self.run_checked_command(["sudo", "-n", "true"], timeout=5)
-        self.state["last_update_requested_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        subprocess.Popen(command, cwd=str(script.parents[1]), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.run_checked_command(["sudo", "-n", "systemctl", "--no-block", "start", "matador-pi-edge-update.service"], timeout=10)
+            return
+        subprocess.Popen([str(script)], cwd=str(script.parents[1]), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def update_result(self) -> dict[str, Any] | None:
         log_path = self.state_dir / "update.log"

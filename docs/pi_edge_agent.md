@@ -160,6 +160,11 @@ reinstalling dependencies and restarting the service. This prevents chmod drift,
 root-owned edits, or interrupted manual support changes from blocking future
 remote updates.
 
+Admin-triggered updates start the dedicated
+`matador-pi-edge-update.service` with `systemctl --no-block` so the update runs
+outside the agent service cgroup. That lets the updater restart
+`matador-pi-edge-agent.service` without killing its own update process.
+
 ## Production And Golden Images
 
 Fresh production install that is enabled for the customer first boot but does

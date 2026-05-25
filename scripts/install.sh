@@ -46,6 +46,8 @@ esac
 SUDOERS_FILE="/etc/sudoers.d/matador-pi-edge-agent"
 cat > "${SUDOERS_FILE}.tmp" <<EOF
 $APP_USER ALL=(root) NOPASSWD: $TRUE_BIN
+$APP_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN --no-block start matador-pi-edge-update.service
+$APP_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN start matador-pi-edge-update.service
 $APP_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN enable --now matador-pi-edge-update.timer
 $APP_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN disable --now matador-pi-edge-update.timer
 $APP_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN reboot
