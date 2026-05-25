@@ -356,6 +356,56 @@ def load_average() -> dict[str, Any]:
         return {}
 
 
+def command_output(command: list[str], *, timeout: int = 3) -> dict[str, Any]:
+    try:
+        result = subprocess.run(command, text=True, capture_output=True, timeout=timeout)
+    except FileNotFoundError:
+        return {"ok": False, "returncode": None, "stdout": "", "stderr": f"{command[0]} not found"}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "returncode": None, "stdout": "", "stderr": f"{' '.join(command)} timed out after {timeout}s"}
+    return {
+        "ok": result.returncode == 0,
+        "returncode": result.returncode,
+        "stdout": result.stdout.strip(),
+        "stderr": result.stderr.strip(),
+    }
+
+
+def network_snapshot() -> dict[str, Any]:
+    snapshot: dict[str, Any] = {"hostname": hostname()}
+    hostname_ips = command_output(["hostname", "-I"], timeout=3)
+    snapshot["ip_addresses"] = [part for part in str(hostname_ips.get("stdout") or "").split() if part]
+
+    default_route_output = command_output(["ip", "route", "show", "default"], timeout=3)
+    default_route = str(default_route_output.get("stdout") or "").splitlines()[0] if default_route_output.get("ok") else ""
+    route_match = re.search(r"default(?: via (?P<gateway>\S+))?(?: dev (?P<interface>\S+))?", default_route)
+    snapshot["default_route"] = {
+        "raw": default_route or None,
+        "gateway": route_match.group("gateway") if route_match else None,
+        "interface": route_match.group("interface") if route_match else None,
+        "ok": bool(default_route),
+    }
+
+    interface_output = command_output(["ip", "-o", "-4", "addr", "show", "scope", "global"], timeout=3)
+    interfaces: list[dict[str, Any]] = []
+    if interface_output.get("ok"):
+        for line in str(interface_output.get("stdout") or "").splitlines():
+            match = re.match(r"\d+:\s+(?P<interface>\S+)\s+inet\s+(?P<address>\S+)", line)
+            if match:
+                interfaces.append({"interface": match.group("interface"), "address": match.group("address")})
+    snapshot["interfaces"] = interfaces
+
+    nameservers: list[str] = []
+    with suppress(OSError):
+        for line in Path("/etc/resolv.conf").read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if stripped.startswith("nameserver "):
+                nameservers.append(stripped.split(None, 1)[1])
+    snapshot["dns_servers"] = nameservers
+    snapshot["ok"] = bool(snapshot["ip_addresses"] and snapshot["default_route"]["ok"])
+    return snapshot
+
+
 def bearer_headers(token: str | None = None) -> dict[str, str]:
     headers = {"Accept": "application/json", "Content-Type": "application/json"}
     if token:
@@ -694,6 +744,18 @@ class PiEdgeAgent:
             default=str,
         )
 
+    def matador_reachability(self) -> dict[str, Any]:
+        url = f"{self.server_url.rstrip('/')}/edge/health"
+        started = time.monotonic()
+        try:
+            request = urllib.request.Request(url, headers={"Accept": "application/json"})
+            with urllib.request.urlopen(request, timeout=5) as response:
+                latency_ms = round((time.monotonic() - started) * 1000)
+                status = int(getattr(response, "status", 0) or response.getcode())
+                return {"ok": 200 <= status < 500, "url": url, "status": status, "latency_ms": latency_ms}
+        except Exception as exc:
+            return {"ok": False, "url": url, "error": str(exc), "latency_ms": round((time.monotonic() - started) * 1000)}
+
     def run_checked_command(self, command: list[str], *, timeout: int, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
         try:
             result = subprocess.run(
@@ -817,6 +879,34 @@ class PiEdgeAgent:
 
         sudo_check = self.command_status(["sudo", "-n", "true"], timeout=5) if os.name != "nt" else {"ok": False, "detail": "not Linux"}
         add("Maintenance sudo", "pass" if sudo_check.get("ok") else "fail", str(sudo_check.get("detail") or "sudo preflight ok"))
+
+        network = network_snapshot()
+        route = network.get("default_route") if isinstance(network.get("default_route"), dict) else {}
+        add(
+            "Network address",
+            "pass" if network.get("ip_addresses") else "fail",
+            ", ".join(network.get("ip_addresses") or []) or "No IP addresses reported",
+            network,
+        )
+        add(
+            "Default route",
+            "pass" if route.get("ok") else "fail",
+            f"{route.get('interface') or 'no interface'} via {route.get('gateway') or 'direct/no gateway'}",
+            route,
+        )
+        add(
+            "DNS servers",
+            "pass" if network.get("dns_servers") else "warn",
+            ", ".join(network.get("dns_servers") or []) or "No DNS servers in /etc/resolv.conf",
+            {"dns_servers": network.get("dns_servers") or []},
+        )
+        reachability = self.matador_reachability()
+        add(
+            "Matador reachability",
+            "pass" if reachability.get("ok") else "fail",
+            f"{reachability.get('status') or reachability.get('error') or 'unknown'} in {reachability.get('latency_ms')} ms",
+            reachability,
+        )
 
         try:
             devices = discover_gofree_devices(min(self.discovery_timeout, 4.0))
@@ -1109,6 +1199,7 @@ class PiEdgeAgent:
                 "disk_guard": self.disk_guard(state_stats, spool_stats),
             },
             "system": load_average(),
+            "network": network_snapshot(),
             "update_timer": self.update_timer_state(),
             "update_result": self.update_result(),
             "counters": self.counters,

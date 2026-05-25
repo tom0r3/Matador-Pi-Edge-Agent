@@ -63,6 +63,12 @@ and remote diagnostics/maintenance from Matador Admin.
   status script and Pi diagnostics page show the log tail and last result.
 - Reports disk pressure as `ok`, `warn`, or `critical` so support can spot a
   growing backlog before the Pi runs out of space.
+- Reports local network diagnostics in health payloads, including Pi IP
+  addresses, default route, interface addresses, DNS servers, and hostname.
+- Self-test probes Matador `/edge/health` reachability so support can
+  distinguish local processor issues from internet/server reachability issues.
+- Pi diagnostics include a Received Data panel showing latest Pi-backed
+  telemetry rows, metric freshness, source counts, and valid/invalid readings.
 - If no enrolment code is configured, phones home with a stable device ID and
   claim code so a Matador admin can approve the Pi from the Admin page.
 
@@ -158,7 +164,8 @@ The updater treats the Pi checkout as an appliance release tree: it fetches the
 configured branch, defaults to `main`, and hard-resets the local files before
 reinstalling dependencies and restarting the service. This prevents chmod drift,
 root-owned edits, or interrupted manual support changes from blocking future
-remote updates.
+remote updates. Git safety is passed per command with `safe.directory`, so the
+systemd update service does not depend on `$HOME` or global Git config.
 
 Admin-triggered updates start the dedicated
 `matador-pi-edge-update.service` with `systemctl --no-block` so the update runs
