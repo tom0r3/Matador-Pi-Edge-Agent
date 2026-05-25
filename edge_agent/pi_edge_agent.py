@@ -371,6 +371,30 @@ def command_output(command: list[str], *, timeout: int = 3) -> dict[str, Any]:
     }
 
 
+def active_wifi_ssid(interface: str = "wlan0") -> dict[str, Any]:
+    iwgetid = command_output(["iwgetid", interface, "-r"], timeout=3)
+    ssid = str(iwgetid.get("stdout") or "").strip()
+    if ssid:
+        return {"interface": interface, "ssid": ssid, "connected": True, "source": "iwgetid"}
+
+    iw_link = command_output(["iw", "dev", interface, "link"], timeout=3)
+    for line in str(iw_link.get("stdout") or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("SSID:"):
+            ssid = stripped.split(":", 1)[1].strip()
+            if ssid:
+                return {"interface": interface, "ssid": ssid, "connected": True, "source": "iw"}
+
+    error = str(iwgetid.get("stderr") or iw_link.get("stderr") or "").strip()
+    return {
+        "interface": interface,
+        "ssid": None,
+        "connected": False,
+        "source": "iwgetid/iw",
+        "error": error or "No active SSID reported",
+    }
+
+
 def network_snapshot() -> dict[str, Any]:
     snapshot: dict[str, Any] = {"hostname": hostname()}
     hostname_ips = command_output(["hostname", "-I"], timeout=3)
@@ -402,6 +426,7 @@ def network_snapshot() -> dict[str, Any]:
             if stripped.startswith("nameserver "):
                 nameservers.append(stripped.split(None, 1)[1])
     snapshot["dns_servers"] = nameservers
+    snapshot["wifi"] = active_wifi_ssid("wlan0")
     snapshot["ok"] = bool(snapshot["ip_addresses"] and snapshot["default_route"]["ok"])
     return snapshot
 
@@ -899,6 +924,13 @@ class PiEdgeAgent:
             "pass" if network.get("dns_servers") else "warn",
             ", ".join(network.get("dns_servers") or []) or "No DNS servers in /etc/resolv.conf",
             {"dns_servers": network.get("dns_servers") or []},
+        )
+        wifi = network.get("wifi") if isinstance(network.get("wifi"), dict) else {}
+        add(
+            "Wi-Fi SSID",
+            "pass" if wifi.get("ssid") else "warn",
+            str(wifi.get("ssid") or wifi.get("error") or "No active wlan0 SSID reported"),
+            wifi,
         )
         reachability = self.matador_reachability()
         add(

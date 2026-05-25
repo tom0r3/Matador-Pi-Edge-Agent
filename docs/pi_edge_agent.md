@@ -64,11 +64,14 @@ and remote diagnostics/maintenance from Matador Admin.
 - Reports disk pressure as `ok`, `warn`, or `critical` so support can spot a
   growing backlog before the Pi runs out of space.
 - Reports local network diagnostics in health payloads, including Pi IP
-  addresses, default route, interface addresses, DNS servers, and hostname.
+  addresses, default route, interface addresses, DNS servers, active `wlan0`
+  SSID, and hostname.
 - Self-test probes Matador `/edge/health` reachability so support can
   distinguish local processor issues from internet/server reachability issues.
 - Pi diagnostics include a Received Data panel showing latest Pi-backed
   telemetry rows, metric freshness, source counts, and valid/invalid readings.
+- Pi diagnostics include a production acceptance checklist for final appliance
+  sign-off before handover.
 - If no enrolment code is configured, phones home with a stable device ID and
   claim code so a Matador admin can approve the Pi from the Admin page.
 
@@ -205,6 +208,26 @@ claim:
 ```bash
 sudo /opt/matador-pi-edge-agent/scripts/factory-reset.sh
 ```
+
+## Production Acceptance Checklist
+
+Use the Pi diagnostics page as the final appliance sign-off point. For each
+new or updated Pi, confirm:
+
+- The Pi is approved to the correct team, has the expected processor name, and
+  shows the correct processor role.
+- The processor lock matches the intended GoFree processor and survives
+  refresh/reconnect without falling back to a DHCP-only identity.
+- Live Health shows the expected Wi-Fi SSID, Pi IP address, default route, DNS
+  servers, queue state, and Matador check-in freshness.
+- Received Data shows current metrics for the expected source, especially wind,
+  heading, GPS, COG, and SOG where those values are available on the vessel.
+- Queue depth stays small when online, grows while uploads are paused/offline,
+  and drains after uploads resume.
+- Remote commands are acknowledged and visible: Run Self-Test, Update Now,
+  Restart Agent, Reboot Pi, Capture Bundle, and Pause/Resume Uploads.
+- Fresh production units start unclaimed, generate a unique hostname on first
+  boot, and do not carry previous device tokens, queue rows, or customer state.
 
 ## Manual Testing
 
