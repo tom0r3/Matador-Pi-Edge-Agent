@@ -56,6 +56,9 @@ and remote diagnostics/maintenance from Matador Admin.
   `self_test`, `update_agent`, `reboot_system`, auto-update timer enable/disable,
   support-bundle capture, queue clearing, hostname update, reset/re-enrol, and
   GoFree rediscovery/reconnect.
+- Shows server-queued command state in Pi diagnostics so admins can see whether
+  `update_agent` and other commands are waiting for pickup or acknowledged by
+  the Pi.
 - Captures update output in `/var/lib/matador-pi-edge-agent/update.log`; the
   status script and Pi diagnostics page show the log tail and last result.
 - Reports disk pressure as `ok`, `warn`, or `critical` so support can spot a
@@ -147,6 +150,15 @@ The update command writes its console output to:
 ```bash
 /var/lib/matador-pi-edge-agent/update.log
 ```
+
+The log is owned/readable by the Pi agent service user after the update so
+Matador Admin can show the recent update tail in diagnostics.
+
+The updater treats the Pi checkout as an appliance release tree: it fetches the
+configured branch, defaults to `main`, and hard-resets the local files before
+reinstalling dependencies and restarting the service. This prevents chmod drift,
+root-owned edits, or interrupted manual support changes from blocking future
+remote updates.
 
 ## Production And Golden Images
 
