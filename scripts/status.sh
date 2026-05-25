@@ -51,8 +51,9 @@ print(f"Counters: {state.get('counters') or {}}")
 
 if spool_path.exists():
     with sqlite3.connect(spool_path) as conn:
-        row = conn.execute("SELECT count(*), min(created_at), max(created_at) FROM outbound_payloads").fetchone()
+        row = conn.execute("SELECT count(*), min(created_at), max(created_at), coalesce(sum(length(payload_json)), 0) FROM outbound_payloads").fetchone()
     print(f"Message queue pending: {row[0] or 0}")
+    print(f"Message queue bytes: {row[3] or 0}")
 else:
     print("Message queue pending: spool database not created yet")
 PY

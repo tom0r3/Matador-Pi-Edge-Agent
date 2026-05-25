@@ -36,6 +36,7 @@ GOFREE_PROCESSOR_PING_TIMEOUT_SECONDS = 15.0
 UPLOAD_BATCH_MAX_READINGS = 250
 UPLOAD_BATCH_MAX_PAYLOADS = 50
 GOLDEN_IMAGE_HOSTNAME_MARKER = "golden-image-hostname.pending"
+SPOOL_MAX_PAYLOADS = 0
 CONFIG_POLL_SECONDS = 10.0
 CLAIM_POLL_SECONDS = 15.0
 IDLE_SLEEP_SECONDS = 1.0
@@ -199,6 +200,7 @@ class PayloadSpool:
             "queued_payload_bytes": int(row[3] or 0),
             "spool_bytes": self.path.stat().st_size if self.path.exists() else 0,
             "spool_max_payloads": self.max_rows,
+            "spool_unlimited": self.max_rows <= 0,
         }
 
 
@@ -1504,8 +1506,8 @@ def parse_args() -> argparse.Namespace:
         "--queue-size",
         dest="spool_max_payloads",
         type=int,
-        default=int(os.environ.get("MATADOR_PI_EDGE_SPOOL_MAX_PAYLOADS", os.environ.get("MATADOR_PI_EDGE_QUEUE_SIZE", "50000"))),
-        help="Maximum durable outbound payloads to retain before oldest payloads are discarded",
+        default=int(os.environ.get("MATADOR_PI_EDGE_SPOOL_MAX_PAYLOADS", os.environ.get("MATADOR_PI_EDGE_QUEUE_SIZE", str(SPOOL_MAX_PAYLOADS)))),
+        help="Maximum durable outbound payloads to retain before oldest payloads are discarded. Set 0 for unlimited.",
     )
     parser.add_argument("--discover-once", action="store_true", help="Print discovered GoFree processors and exit")
     parser.add_argument("--log-level", default=os.environ.get("MATADOR_PI_EDGE_LOG_LEVEL", "INFO"), help="Python logging level")
