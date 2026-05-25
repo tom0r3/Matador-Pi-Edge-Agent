@@ -27,6 +27,7 @@ All notable project changes will be recorded here.
 - Fixed the Pi Edge first-boot hostname path by importing the hashing library used to derive hardware-based hostname suffixes.
 - Changed Pi Edge claim handling so a new pending claim from the same hostname supersedes older pending claim records, preventing duplicate approval cards after reset/golden-image preparation.
 - Added local Pi Edge `factory-reset.sh` and `prepare-golden-image.sh` wrappers, and made production-prep installs update `/etc/hosts` alongside the reset hostname.
+- Added a Pi Edge diagnostics maintenance control for remotely rebooting the Raspberry Pi, backed by a narrow sudoers rule for `systemctl reboot`.
 
 ## 2026-05-17 - Version 3.5.1
 
