@@ -37,7 +37,9 @@ cat > "${SUDOERS_FILE}.tmp" <<EOF
 $APP_USER ALL=(root) NOPASSWD: $TRUE_BIN
 $APP_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN enable --now matador-pi-edge-update.timer
 $APP_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN disable --now matador-pi-edge-update.timer
+$APP_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN reboot
 $APP_USER ALL=(root) NOPASSWD: $HOSTNAMECTL_BIN set-hostname *
+$APP_USER ALL=(root) NOPASSWD: $APP_DIR/scripts/set-hostname.sh *
 $APP_USER ALL=(root) NOPASSWD: $APP_DIR/scripts/update.sh
 EOF
 chmod 0440 "${SUDOERS_FILE}.tmp"

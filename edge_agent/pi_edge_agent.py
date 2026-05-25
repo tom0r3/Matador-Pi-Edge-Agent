@@ -25,7 +25,7 @@ import websockets
 
 
 APP_NAME = "Matador Pi Edge Agent"
-DEFAULT_APP_VERSION = "3.5.2"
+DEFAULT_APP_VERSION = "3.5.3"
 DEFAULT_SERVER = "https://matador.torodatasystems.eu"
 GOFREE_DISCOVERY_GROUP = "239.2.1.1"
 GOFREE_DISCOVERY_PORTS = (2052, 2050)
@@ -838,7 +838,11 @@ class PiEdgeAgent:
             raise RuntimeError("Hostname must contain letters, numbers, or hyphens and be 1-63 characters")
         if os.name == "nt":
             raise RuntimeError("Hostname changes are only supported on Raspberry Pi/Linux agents")
-        self.run_checked_command(["sudo", "-n", "hostnamectl", "set-hostname", cleaned], timeout=15)
+        helper = Path(__file__).resolve().parents[1] / "scripts" / "set-hostname.sh"
+        if helper.exists():
+            self.run_checked_command(["sudo", "-n", str(helper), cleaned], timeout=20)
+        else:
+            self.run_checked_command(["sudo", "-n", "hostnamectl", "set-hostname", cleaned], timeout=15)
         self.state["requested_hostname"] = cleaned
 
     def ensure_unique_hostname_for_golden_image(self) -> None:
@@ -912,6 +916,15 @@ class PiEdgeAgent:
                 self.state["last_support_bundle"] = self.support_bundle()
             elif action == "self_test":
                 self.run_self_test()
+            elif action == "reboot_system":
+                acked = self.acknowledge_remote_command(requested_at)
+                self.record_command_result(action, "ok", "System reboot requested by Matador admin")
+                if acked:
+                    self.last_remote_command_at = requested_at
+                    self.state["last_remote_command_at"] = requested_at
+                self.save_state()
+                self.run_checked_command(["sudo", "-n", "systemctl", "reboot"], timeout=10)
+                return
             elif action == "set_hostname":
                 self.set_system_hostname(argument)
             elif action == "update_agent":

@@ -48,7 +48,9 @@ cat > "${SUDOERS_FILE}.tmp" <<EOF
 $APP_USER ALL=(root) NOPASSWD: $TRUE_BIN
 $APP_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN enable --now matador-pi-edge-update.timer
 $APP_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN disable --now matador-pi-edge-update.timer
+$APP_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN reboot
 $APP_USER ALL=(root) NOPASSWD: $HOSTNAMECTL_BIN set-hostname *
+$APP_USER ALL=(root) NOPASSWD: $APP_DIR/scripts/set-hostname.sh *
 $APP_USER ALL=(root) NOPASSWD: $APP_DIR/scripts/update.sh
 EOF
 chmod 0440 "${SUDOERS_FILE}.tmp"
@@ -64,12 +66,7 @@ if [ "$START_NOW" = "0" ] || [ "$START_NOW" = "false" ] || [ "$START_NOW" = "no"
   install -d -o "$APP_USER" -g "$APP_USER" -m 0750 "$STATE_DIR"
   touch "$STATE_DIR/golden-image-hostname.pending"
   chown "$APP_USER:$APP_USER" "$STATE_DIR/golden-image-hostname.pending"
-  hostnamectl set-hostname "$TARGET_HOSTNAME"
-  if grep -q "^127.0.1.1" /etc/hosts; then
-    sed -i "s/^127.0.1.1.*/127.0.1.1\t$TARGET_HOSTNAME/" /etc/hosts
-  else
-    printf "127.0.1.1\t%s\n" "$TARGET_HOSTNAME" >> /etc/hosts
-  fi
+  "$APP_DIR/scripts/set-hostname.sh" "$TARGET_HOSTNAME"
   systemctl enable "$SERVICE_NAME"
   systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
   START_MESSAGE="Service is enabled for the customer's first boot, but was not started during install."
