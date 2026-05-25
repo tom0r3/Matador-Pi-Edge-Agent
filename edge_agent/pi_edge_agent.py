@@ -25,7 +25,7 @@ import websockets
 
 
 APP_NAME = "Matador Pi Edge Agent"
-DEFAULT_APP_VERSION = "3.5.3"
+DEFAULT_APP_VERSION = "3.5.8"
 DEFAULT_SERVER = "https://matador.torodatasystems.eu"
 GOFREE_DISCOVERY_GROUP = "239.2.1.1"
 GOFREE_DISCOVERY_PORTS = (2052, 2050)
@@ -37,6 +37,9 @@ UPLOAD_BATCH_MAX_READINGS = 250
 UPLOAD_BATCH_MAX_PAYLOADS = 50
 GOLDEN_IMAGE_HOSTNAME_MARKER = "golden-image-hostname.pending"
 SPOOL_MAX_PAYLOADS = 0
+DISK_WARN_USED_PERCENT = 70.0
+DISK_CRITICAL_USED_PERCENT = 85.0
+DISK_STOP_BUFFERING_USED_PERCENT = 95.0
 CONFIG_POLL_SECONDS = 10.0
 CLAIM_POLL_SECONDS = 15.0
 IDLE_SLEEP_SECONDS = 1.0
@@ -332,6 +335,17 @@ def disk_stats(path: Path) -> dict[str, Any]:
         }
     except OSError as exc:
         return {"path": str(path), "error": str(exc)}
+
+
+def tail_text(path: Path, max_bytes: int = 20000) -> str:
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as handle:
+            if size > max_bytes:
+                handle.seek(-max_bytes, os.SEEK_END)
+            return handle.read().decode("utf-8", errors="replace")
+    except OSError:
+        return ""
 
 
 def load_average() -> dict[str, Any]:
@@ -835,7 +849,60 @@ class PiEdgeAgent:
         command = ["sudo", "-n", str(script)] if os.name != "nt" else [str(script)]
         if os.name != "nt":
             self.run_checked_command(["sudo", "-n", "true"], timeout=5)
+        self.state["last_update_requested_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         subprocess.Popen(command, cwd=str(script.parents[1]), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def update_result(self) -> dict[str, Any] | None:
+        log_path = self.state_dir / "update.log"
+        if not log_path.exists():
+            return None
+        content = tail_text(log_path)
+        lower = content.lower()
+        status = "unknown"
+        if "update completed at" in lower:
+            status = "ok"
+        elif any(token in lower for token in ("fatal:", "error:", "failed", "traceback")):
+            status = "error"
+        result: dict[str, Any] = {
+            "status": status,
+            "log_path": str(log_path),
+            "requested_at": self.state.get("last_update_requested_at") or None,
+            "log_tail": content[-8000:],
+        }
+        with suppress(OSError):
+            result["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(log_path.stat().st_mtime))
+        return result
+
+    def disk_guard(self, state_stats: dict[str, Any], spool_stats: dict[str, Any]) -> dict[str, Any]:
+        used = float_or_none(state_stats.get("used_percent"))
+        pending = int(spool_stats.get("pending_payloads") or 0)
+        queue_bytes = int(spool_stats.get("queued_payload_bytes") or 0)
+        if used is None:
+            return {"level": "unknown", "message": "Disk usage unavailable", "can_buffer": True}
+        if used >= DISK_STOP_BUFFERING_USED_PERCENT:
+            level = "critical"
+            message = f"Disk is {used:.1f}% full; buffering is at risk."
+            can_buffer = False
+        elif used >= DISK_CRITICAL_USED_PERCENT:
+            level = "critical"
+            message = f"Disk is {used:.1f}% full; resume uploads or clear backlog soon."
+            can_buffer = True
+        elif used >= DISK_WARN_USED_PERCENT:
+            level = "warn"
+            message = f"Disk is {used:.1f}% full; monitor queue growth."
+            can_buffer = True
+        else:
+            level = "ok"
+            message = f"Disk is {used:.1f}% full."
+            can_buffer = True
+        return {
+            "level": level,
+            "message": message,
+            "can_buffer": can_buffer,
+            "used_percent": used,
+            "pending_payloads": pending,
+            "queued_payload_bytes": queue_bytes,
+        }
 
     def set_auto_update_timer(self, enabled: bool) -> None:
         if os.name == "nt":
@@ -988,6 +1055,7 @@ class PiEdgeAgent:
 
     def health_payload(self, *, include_support_bundle: bool = True) -> dict[str, Any]:
         spool_stats = self.spool.stats()
+        state_stats = disk_stats(self.state_dir)
         processor_queued = int(self.counters.get("processor_payloads_queued") or 0)
         pending = int(spool_stats.get("pending_payloads") or 0)
         upload_rate = float_or_none(self.state.get("upload_rate_payloads_per_second"))
@@ -1028,7 +1096,7 @@ class PiEdgeAgent:
                 "upload_batch_max_payloads": self.upload_batch_max_payloads,
             },
             "storage": {
-                "state_dir": disk_stats(self.state_dir),
+                "state_dir": state_stats,
                 "spool": {
                     **spool_stats,
                     "estimated_delivered_payloads": max(0, processor_queued - pending),
@@ -1037,9 +1105,11 @@ class PiEdgeAgent:
                     "upload_rate_readings_per_second": float_or_none(self.state.get("upload_rate_readings_per_second")),
                     "estimated_drain_eta_seconds": queue_eta_seconds,
                 },
+                "disk_guard": self.disk_guard(state_stats, spool_stats),
             },
             "system": load_average(),
             "update_timer": self.update_timer_state(),
+            "update_result": self.update_result(),
             "counters": self.counters,
             "links": {
                 "last_config_at": self.state.get("last_config_at") or None,

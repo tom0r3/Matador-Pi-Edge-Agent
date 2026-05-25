@@ -26,6 +26,7 @@ state_dir = Path(os.environ.get("MATADOR_PI_EDGE_STATE_DIR", "/var/lib/matador-p
 state_path = state_dir / "state.json"
 spool_path = state_dir / "outbound-spool.sqlite3"
 golden_hostname_marker = state_dir / "golden-image-hostname.pending"
+update_log_path = state_dir / "update.log"
 
 state = {}
 if state_path.exists():
@@ -48,6 +49,11 @@ for processor in state.get("last_discovered_processors") or []:
     title = " - ".join(str(processor.get(key) or "") for key in ("name", "model", "serial_number") if processor.get(key))
     print(f"  - {title or 'GoFree processor'} @ {processor.get('last_host') or '-'}:{processor.get('port') or 2053}")
 print(f"Counters: {state.get('counters') or {}}")
+if update_log_path.exists():
+    print(f"Update log: {update_log_path}")
+    tail = update_log_path.read_text(encoding="utf-8", errors="replace")[-1200:]
+    print("Update log tail:")
+    print(tail.rstrip() or "-")
 
 if spool_path.exists():
     with sqlite3.connect(spool_path) as conn:

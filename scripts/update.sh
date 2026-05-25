@@ -2,7 +2,9 @@
 set -euo pipefail
 
 APP_DIR="${MATADOR_PI_EDGE_APP_DIR:-/opt/matador-pi-edge-agent}"
+STATE_DIR="${MATADOR_PI_EDGE_STATE_DIR:-/var/lib/matador-pi-edge-agent}"
 SERVICE_NAME="matador-pi-edge-agent.service"
+LOG_FILE="$STATE_DIR/update.log"
 
 if [ "$(id -u)" -ne 0 ]; then
   echo "Please run as root, for example: sudo ./scripts/update.sh" >&2
@@ -16,6 +18,11 @@ if [ ! -d "$APP_DIR/.git" ]; then
 fi
 
 echo "Updating Matador Pi Edge Agent..."
+mkdir -p "$STATE_DIR"
+touch "$LOG_FILE"
+chmod 0640 "$LOG_FILE" || true
+exec > >(tee "$LOG_FILE") 2>&1
+echo "Update started at $(date -Is)"
 
 cd "$APP_DIR"
 git pull --ff-only
@@ -52,3 +59,4 @@ cp deploy/matador-pi-edge-update.timer /etc/systemd/system/matador-pi-edge-updat
 systemctl daemon-reload
 systemctl restart "$SERVICE_NAME"
 systemctl status "$SERVICE_NAME" --no-pager -l
+echo "Update completed at $(date -Is)"

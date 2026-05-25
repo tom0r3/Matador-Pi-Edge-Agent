@@ -1,10 +1,10 @@
 # Matador Pi Edge Agent
 
 The Matador Pi Edge Agent is the headless Raspberry Pi companion to the
-Windows Matador Edge Agent. Version 3.5.2 compresses the original appliance
-roadmap into three larger stages and implements the Stage 3 client-side
-foundation: unattended operation, discovery, durable offline spooling, remote
-commands, health/storage telemetry, and no-code admin claiming.
+Windows Matador Edge Agent. Version 3.5.8 is the current production baseline:
+unattended operation, discovery, durable offline spooling, remote commands,
+health/storage telemetry, no-code admin claiming, golden-image preparation,
+and remote diagnostics/maintenance from Matador Admin.
 
 ## Three-Stage Appliance Roadmap
 
@@ -16,7 +16,7 @@ commands, health/storage telemetry, and no-code admin claiming.
   server-visible health payloads, remote start/stop/connect commands, and
   no-code admin claiming for pre-imaged appliances.
 
-## Version 3.5.2 Capabilities
+## Version 3.5.8 Capabilities
 
 - Runs unattended as a Python module under `systemd`.
 - Discovers B&G GoFree processors from UDP multicast `239.2.1.1` on ports
@@ -33,17 +33,33 @@ commands, health/storage telemetry, and no-code admin claiming.
   `/edge/stream` endpoint.
 - Stores unsent payloads in a durable SQLite spool at
   `/var/lib/matador-pi-edge-agent/outbound-spool.sqlite3`.
+- Keeps the durable spool unlimited by default so offline data is not dropped
+  at an arbitrary row cap. Set `MATADOR_PI_EDGE_SPOOL_MAX_PAYLOADS` only if a
+  deliberate field cap is required.
 - Uploads queued payloads in bounded batches so outage backlogs drain quickly
   after internet service returns.
 - Keeps spooled payloads until Matador acknowledges the batch, then deletes
   the acknowledged rows.
 - Reports Pi hostname, app version, load average, spool depth, spool size, and
   filesystem capacity in the upstream `pi_health` payload.
+- Reports current app version, hostname, local processor host, queue state,
+  disk guard state, and update-result telemetry during config check-ins, so
+  Admin remains fresh even when upstream uploads are paused.
 - Separates active queued payload bytes from SQLite spool file size, since the
   database file may remain large after a backlog has drained.
+- Keeps `/etc/hosts` in sync when first-boot hostname uniquing or remote
+  hostname changes update the system hostname.
 - Polls Matador config every 10 seconds for remote commands.
 - Supports existing Edge remote command actions:
   `connect_processor`, `start_streaming`, and `stop_streaming`.
+- Supports Pi maintenance commands from the diagnostics page, including
+  `self_test`, `update_agent`, `reboot_system`, auto-update timer enable/disable,
+  support-bundle capture, queue clearing, hostname update, reset/re-enrol, and
+  GoFree rediscovery/reconnect.
+- Captures update output in `/var/lib/matador-pi-edge-agent/update.log`; the
+  status script and Pi diagnostics page show the log tail and last result.
+- Reports disk pressure as `ok`, `warn`, or `critical` so support can spot a
+  growing backlog before the Pi runs out of space.
 - If no enrolment code is configured, phones home with a stable device ID and
   claim code so a Matador admin can approve the Pi from the Admin page.
 
@@ -83,7 +99,8 @@ MATADOR_EDGE_SERVER=https://matador.torodatasystems.eu
 MATADOR_EDGE_ENROLLMENT_CODE=PASTE-ONE-TIME-EDGE-CODE-HERE
 MATADOR_PI_EDGE_STATE_DIR=/var/lib/matador-pi-edge-agent
 MATADOR_DISCOVERY_TIMEOUT=8
-MATADOR_PI_EDGE_SPOOL_MAX_PAYLOADS=50000
+# 0 means unlimited retention. Use a positive value only for a deliberate cap.
+MATADOR_PI_EDGE_SPOOL_MAX_PAYLOADS=0
 MATADOR_PI_EDGE_PROCESSOR_PING_INTERVAL_SECONDS=30
 MATADOR_PI_EDGE_PROCESSOR_PING_TIMEOUT_SECONDS=15
 MATADOR_PI_EDGE_DATA_SILENCE_RECONNECT_SECONDS=90
@@ -110,6 +127,59 @@ View logs:
 
 ```bash
 sudo journalctl -u matador-pi-edge-agent.service -f
+```
+
+Check local status:
+
+```bash
+sudo /opt/matador-pi-edge-agent/scripts/status.sh
+```
+
+Update from GitHub:
+
+```bash
+cd /opt/matador-pi-edge-agent
+sudo ./scripts/update.sh
+```
+
+The update command writes its console output to:
+
+```bash
+/var/lib/matador-pi-edge-agent/update.log
+```
+
+## Production And Golden Images
+
+Fresh production install that is enabled for the customer first boot but does
+not phone home during preparation:
+
+```bash
+cd /opt
+sudo git clone https://github.com/tom0r3/Matador-Pi-Edge-Agent.git matador-pi-edge-agent
+sudo chown -R "$USER:$USER" /opt/matador-pi-edge-agent
+cd /opt/matador-pi-edge-agent
+sudo MATADOR_PI_EDGE_START_NOW=0 ./scripts/install.sh
+```
+
+Prepare an already configured Pi as a cloneable golden image:
+
+```bash
+cd /opt/matador-pi-edge-agent
+sudo ./scripts/prepare-golden-image.sh
+```
+
+That clears local claim/config/queue state, resets the hostname seed to
+`matador-pi-edge`, leaves first-boot hostname uniquing pending, disables active
+phone-home during preparation, and shuts down ready for SD-card imaging. On
+the customer's first boot the service starts, derives a stable hardware-based
+hostname suffix, updates `/etc/hostname` and `/etc/hosts`, and then phones home
+for approval.
+
+Factory reset an installed Pi so it reboots and appears as a fresh pending
+claim:
+
+```bash
+sudo /opt/matador-pi-edge-agent/scripts/factory-reset.sh
 ```
 
 ## Manual Testing
@@ -140,8 +210,9 @@ Use a fixed processor IP if multicast discovery is unavailable:
 
 ## Remaining Gaps
 
-- The dashboard exposes pending Pi claims and per-card health/status, but there
-  is not yet a dedicated Pi appliance fleet-management page.
+- The Pi diagnostics page now provides appliance support controls, but a wider
+  fleet-management workflow for rollout batches, staged releases, and hardware
+  inventory is still a future production-polish item.
 - Processor identity locking is available from Admin approval. It prefers
   serial number, then name/model, then name, so DHCP address changes are safe.
   Hercules/v2 processors normally advertise the serial in discovery. H5000/v1
