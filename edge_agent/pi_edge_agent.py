@@ -12,11 +12,12 @@ import shutil
 import socket
 import sqlite3
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.request
 import uuid
-from contextlib import closing, suppress
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -104,17 +105,29 @@ class PayloadSpool:
     def __init__(self, path: Path, max_rows: int) -> None:
         self.path = path
         self.max_rows = max_rows
+        self._lock = threading.RLock()
         self._ensure_schema()
 
     def _connect(self) -> sqlite3.Connection:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(self.path)
+        conn = sqlite3.connect(self.path, timeout=30.0)
+        conn.execute("PRAGMA busy_timeout=30000")
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         return conn
 
+    @contextmanager
+    def _connection(self):
+        with self._lock:
+            conn = self._connect()
+            try:
+                yield conn
+                conn.commit()
+            finally:
+                conn.close()
+
     def _ensure_schema(self) -> None:
-        with closing(self._connect()) as conn:
+        with self._connection() as conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS outbound_payloads (
@@ -128,7 +141,7 @@ class PayloadSpool:
 
     def enqueue(self, payload: dict[str, Any]) -> None:
         encoded = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
-        with closing(self._connect()) as conn:
+        with self._connection() as conn:
             conn.execute(
                 "INSERT INTO outbound_payloads (created_at, payload_json) VALUES (?, ?)",
                 (time.time(), encoded),
@@ -148,7 +161,7 @@ class PayloadSpool:
                 )
 
     def peek_oldest(self) -> tuple[int, dict[str, Any]] | None:
-        with closing(self._connect()) as conn:
+        with self._connection() as conn:
             row = conn.execute(
                 "SELECT id, payload_json FROM outbound_payloads ORDER BY id ASC LIMIT 1"
             ).fetchone()
@@ -159,7 +172,7 @@ class PayloadSpool:
     def peek_oldest_batch(self, max_payloads: int, max_readings: int) -> list[tuple[int, dict[str, Any]]]:
         row_limit = max(1, max_payloads)
         reading_limit = max(1, max_readings)
-        with closing(self._connect()) as conn:
+        with self._connection() as conn:
             rows = conn.execute(
                 "SELECT id, payload_json FROM outbound_payloads ORDER BY id ASC LIMIT ?",
                 (row_limit,),
@@ -177,22 +190,23 @@ class PayloadSpool:
         return batch
 
     def ack(self, payload_id: int) -> None:
-        with closing(self._connect()) as conn:
+        with self._connection() as conn:
             conn.execute("DELETE FROM outbound_payloads WHERE id = ?", (payload_id,))
 
     def ack_many(self, payload_ids: list[int]) -> None:
         if not payload_ids:
             return
         placeholders = ",".join("?" for _ in payload_ids)
-        with closing(self._connect()) as conn:
+        with self._connection() as conn:
             conn.execute(f"DELETE FROM outbound_payloads WHERE id IN ({placeholders})", payload_ids)
 
     def clear(self) -> None:
-        with closing(self._connect()) as conn:
+        with self._connection() as conn:
             conn.execute("DELETE FROM outbound_payloads")
+            conn.execute("DELETE FROM sqlite_sequence WHERE name = 'outbound_payloads'")
 
     def stats(self) -> dict[str, Any]:
-        with closing(self._connect()) as conn:
+        with self._connection() as conn:
             row = conn.execute(
                 "SELECT count(*), min(created_at), max(created_at), coalesce(sum(length(payload_json)), 0) FROM outbound_payloads"
             ).fetchone()
@@ -945,6 +959,14 @@ class PiEdgeAgent:
         with suppress(asyncio.QueueFull):
             self.live_payload_queue.put_nowait(outgoing)
 
+    def clear_runtime_queues(self) -> None:
+        while True:
+            try:
+                self.live_payload_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        self._reset_storage_sample()
+
     def run_self_test(self) -> dict[str, Any]:
         generated_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         checks: list[dict[str, Any]] = []
@@ -1195,7 +1217,11 @@ class PiEdgeAgent:
                 self.upload_paused = False
                 self.streaming_enabled = True
             elif action == "clear_queue":
+                self.clear_runtime_queues()
                 self.spool.clear()
+                self.state["upload_rate_payloads_per_second"] = 0
+                self.state["upload_rate_readings_per_second"] = 0
+                self.state["last_queue_cleared_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             elif action == "support_bundle":
                 self.state["last_support_bundle"] = self.support_bundle()
             elif action == "self_test":

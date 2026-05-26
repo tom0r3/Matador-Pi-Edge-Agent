@@ -30,7 +30,12 @@ update_log_path = state_dir / "update.log"
 
 state = {}
 if state_path.exists():
-    state = json.loads(state_path.read_text(encoding="utf-8"))
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except PermissionError:
+        print(f"State file: permission denied reading {state_path}; run this status script with sudo for full details.")
+    except json.JSONDecodeError as exc:
+        print(f"State file: invalid JSON in {state_path}: {exc}")
 
 print(f"Claim code: {state.get('claim_code') or '-'}")
 print(f"Device token present: {'yes' if state.get('device_token') else 'no'}")
@@ -51,15 +56,24 @@ for processor in state.get("last_discovered_processors") or []:
 print(f"Counters: {state.get('counters') or {}}")
 if update_log_path.exists():
     print(f"Update log: {update_log_path}")
-    tail = update_log_path.read_text(encoding="utf-8", errors="replace")[-1200:]
-    print("Update log tail:")
-    print(tail.rstrip() or "-")
+    try:
+        tail = update_log_path.read_text(encoding="utf-8", errors="replace")[-1200:]
+        print("Update log tail:")
+        print(tail.rstrip() or "-")
+    except PermissionError:
+        print("Update log tail: permission denied; run with sudo for full details.")
 
 if spool_path.exists():
-    with sqlite3.connect(spool_path) as conn:
-        row = conn.execute("SELECT count(*), min(created_at), max(created_at), coalesce(sum(length(payload_json)), 0) FROM outbound_payloads").fetchone()
-    print(f"Message queue pending: {row[0] or 0}")
-    print(f"Message queue bytes: {row[3] or 0}")
+    try:
+        with sqlite3.connect(spool_path, timeout=30.0) as conn:
+            conn.execute("PRAGMA busy_timeout=30000")
+            row = conn.execute("SELECT count(*), min(created_at), max(created_at), coalesce(sum(length(payload_json)), 0) FROM outbound_payloads").fetchone()
+        print(f"Message queue pending: {row[0] or 0}")
+        print(f"Message queue bytes: {row[3] or 0}")
+    except PermissionError:
+        print(f"Message queue pending: permission denied reading {spool_path}; run with sudo for queue details.")
+    except sqlite3.OperationalError as exc:
+        print(f"Message queue pending: unable to read spool database: {exc}")
 else:
     print("Message queue pending: spool database not created yet")
 PY

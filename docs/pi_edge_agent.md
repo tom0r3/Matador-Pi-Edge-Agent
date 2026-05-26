@@ -63,6 +63,10 @@ and remote diagnostics/maintenance from Matador Admin.
   `self_test`, `update_agent`, `reboot_system`, auto-update timer enable/disable,
   support-bundle capture, queue clearing, hostname update, reset/re-enrol, and
   GoFree rediscovery/reconnect.
+- Queue clearing removes the durable SQLite spool and the in-memory live/sample
+  buffers, then records `last_queue_cleared_at` in local state. The spool uses
+  serialized SQLite access and a longer busy timeout so clear/ack/enqueue
+  operations do not trip over each other during heavy backlog maintenance.
 - Lets support download the latest captured support bundle from the Pi Support
   page after a bundle has been collected and reported by the agent.
 - Shows server-queued command state in Pi diagnostics so admins can see whether
