@@ -16,7 +16,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from contextlib import suppress
+from contextlib import closing, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -35,6 +35,7 @@ GOFREE_PROCESSOR_PING_INTERVAL_SECONDS = 30.0
 GOFREE_PROCESSOR_PING_TIMEOUT_SECONDS = 15.0
 UPLOAD_BATCH_MAX_READINGS = 250
 UPLOAD_BATCH_MAX_PAYLOADS = 50
+STORAGE_SAMPLE_HZ = 1.0
 GOLDEN_IMAGE_HOSTNAME_MARKER = "golden-image-hostname.pending"
 SPOOL_MAX_PAYLOADS = 0
 DISK_WARN_USED_PERCENT = 70.0
@@ -113,7 +114,7 @@ class PayloadSpool:
         return conn
 
     def _ensure_schema(self) -> None:
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS outbound_payloads (
@@ -127,7 +128,7 @@ class PayloadSpool:
 
     def enqueue(self, payload: dict[str, Any]) -> None:
         encoded = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             conn.execute(
                 "INSERT INTO outbound_payloads (created_at, payload_json) VALUES (?, ?)",
                 (time.time(), encoded),
@@ -147,7 +148,7 @@ class PayloadSpool:
                 )
 
     def peek_oldest(self) -> tuple[int, dict[str, Any]] | None:
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             row = conn.execute(
                 "SELECT id, payload_json FROM outbound_payloads ORDER BY id ASC LIMIT 1"
             ).fetchone()
@@ -158,7 +159,7 @@ class PayloadSpool:
     def peek_oldest_batch(self, max_payloads: int, max_readings: int) -> list[tuple[int, dict[str, Any]]]:
         row_limit = max(1, max_payloads)
         reading_limit = max(1, max_readings)
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             rows = conn.execute(
                 "SELECT id, payload_json FROM outbound_payloads ORDER BY id ASC LIMIT ?",
                 (row_limit,),
@@ -176,22 +177,22 @@ class PayloadSpool:
         return batch
 
     def ack(self, payload_id: int) -> None:
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             conn.execute("DELETE FROM outbound_payloads WHERE id = ?", (payload_id,))
 
     def ack_many(self, payload_ids: list[int]) -> None:
         if not payload_ids:
             return
         placeholders = ",".join("?" for _ in payload_ids)
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             conn.execute(f"DELETE FROM outbound_payloads WHERE id IN ({placeholders})", payload_ids)
 
     def clear(self) -> None:
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             conn.execute("DELETE FROM outbound_payloads")
 
     def stats(self) -> dict[str, Any]:
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             row = conn.execute(
                 "SELECT count(*), min(created_at), max(created_at), coalesce(sum(length(payload_json)), 0) FROM outbound_payloads"
             ).fetchone()
@@ -566,6 +567,7 @@ class PiEdgeAgent:
         processor_ping_timeout_seconds: float,
         upload_batch_max_readings: int,
         upload_batch_max_payloads: int,
+        storage_sample_hz: float,
     ) -> None:
         self.server_url = server_url.rstrip("/")
         self.state_dir = state_dir
@@ -580,6 +582,8 @@ class PiEdgeAgent:
         self.processor_ping_timeout_seconds = processor_ping_timeout_seconds if processor_ping_timeout_seconds > 0 else None
         self.upload_batch_max_readings = max(1, min(500, upload_batch_max_readings))
         self.upload_batch_max_payloads = max(1, upload_batch_max_payloads)
+        self.storage_sample_hz = max(0.0, storage_sample_hz)
+        self.storage_sample_interval_seconds = 0.0 if self.storage_sample_hz <= 0 else 1.0 / self.storage_sample_hz
         self.data_info_by_metric_id: dict[int, dict[str, Any]] = {}
         self.setting_by_id: dict[int, dict[str, Any]] = {}
         self.stop_event = asyncio.Event()
@@ -591,6 +595,10 @@ class PiEdgeAgent:
         self.counters = dict(self.state.get("counters") or {})
         self.current_processor_identity = dict(self.state.get("current_processor_identity") or {})
         self.processor_reconnect_requested = False
+        self.live_payload_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=100)
+        self._storage_sample_bucket: int | None = None
+        self._storage_sample_payload: dict[str, Any] | None = None
+        self._storage_sample_items: dict[tuple[int, int], dict[str, Any]] = {}
 
     def increment_counter(self, name: str, amount: int = 1) -> None:
         self.counters[name] = int(self.counters.get(name) or 0) + amount
@@ -867,6 +875,75 @@ class PiEdgeAgent:
                 reading_rate if old_reading_rate is None else (old_reading_rate * 0.75) + (reading_rate * 0.25)
             )
         self.state["upload_rate_sample_time"] = now
+
+    def _storage_sample_key(self, item: dict[str, Any]) -> tuple[int, int] | None:
+        metric_id = int_or_none(item.get("id") or item.get("metric_id"))
+        if metric_id is None:
+            return None
+        instance = int_or_none(item.get("inst") or item.get("instance")) or 0
+        return metric_id, instance
+
+    def _build_storage_sample_payload(self) -> dict[str, Any] | None:
+        if not self._storage_sample_payload or not self._storage_sample_items:
+            return None
+        payload = dict(self._storage_sample_payload)
+        payload["Data"] = list(self._storage_sample_items.values())
+        return payload
+
+    def _reset_storage_sample(self, *, bucket: int | None = None, payload: dict[str, Any] | None = None) -> None:
+        self._storage_sample_bucket = bucket
+        self._storage_sample_payload = dict(payload) if payload else None
+        self._storage_sample_items = {}
+
+    def historical_payloads_for_storage(self, outgoing: dict[str, Any]) -> list[dict[str, Any]]:
+        if self.storage_sample_interval_seconds <= 0:
+            return [outgoing]
+        sent_at = float_or_none(outgoing.get("sent_at")) or time.time()
+        bucket = int(sent_at / self.storage_sample_interval_seconds)
+        payloads: list[dict[str, Any]] = []
+        if self._storage_sample_bucket is None:
+            self._reset_storage_sample(bucket=bucket, payload=outgoing)
+        elif bucket != self._storage_sample_bucket:
+            flushed = self._build_storage_sample_payload()
+            if flushed:
+                payloads.append(flushed)
+            self._reset_storage_sample(bucket=bucket, payload=outgoing)
+        else:
+            self._storage_sample_payload = dict(outgoing)
+
+        for item in outgoing.get("Data") or []:
+            if not isinstance(item, dict):
+                continue
+            key = self._storage_sample_key(item)
+            if key is None:
+                continue
+            stored_item = dict(item)
+            stored_item.setdefault("time", sent_at)
+            self._storage_sample_items[key] = stored_item
+        return payloads
+
+    def flush_historical_storage_sample(self) -> dict[str, Any] | None:
+        payload = self._build_storage_sample_payload()
+        self._reset_storage_sample()
+        return payload
+
+    async def enqueue_historical_payloads(self, outgoing: dict[str, Any]) -> None:
+        for payload in self.historical_payloads_for_storage(outgoing):
+            self.increment_counter("processor_payloads_queued")
+            await asyncio.to_thread(self.spool.enqueue, payload)
+
+    async def flush_historical_payloads(self) -> None:
+        payload = self.flush_historical_storage_sample()
+        if payload:
+            self.increment_counter("processor_payloads_queued")
+            await asyncio.to_thread(self.spool.enqueue, payload)
+
+    def enqueue_live_payload(self, outgoing: dict[str, Any]) -> None:
+        if self.live_payload_queue.full():
+            with suppress(asyncio.QueueEmpty):
+                self.live_payload_queue.get_nowait()
+        with suppress(asyncio.QueueFull):
+            self.live_payload_queue.put_nowait(outgoing)
 
     def run_self_test(self) -> dict[str, Any]:
         generated_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -1217,6 +1294,7 @@ class PiEdgeAgent:
                 "data_silence_reconnect_seconds": self.data_silence_reconnect_seconds,
                 "upload_batch_max_readings": self.upload_batch_max_readings,
                 "upload_batch_max_payloads": self.upload_batch_max_payloads,
+                "historical_storage_sample_hz": self.storage_sample_hz,
             },
             "storage": {
                 "state_dir": state_stats,
@@ -1477,11 +1555,14 @@ class PiEdgeAgent:
                     continue
                 processor_host, processor_port, processor_path = self.resolve_processor()
                 await self.processor_once(processor_host, processor_port, processor_path)
+                await self.flush_historical_payloads()
                 backoff = 1.0
             except RestartRequested:
+                await self.flush_historical_payloads()
                 self.stop_event.set()
                 raise
             except Exception as exc:
+                await self.flush_historical_payloads()
                 LOGGER.warning("Processor loop interrupted: %s. Reconnecting in %.1fs", exc, backoff)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60.0)
@@ -1545,8 +1626,8 @@ class PiEdgeAgent:
                 }
                 if not outgoing["Data"]:
                     continue
-                self.increment_counter("processor_payloads_queued")
-                await asyncio.to_thread(self.spool.enqueue, outgoing)
+                self.enqueue_live_payload(outgoing)
+                await self.enqueue_historical_payloads(outgoing)
 
     async def stream_loop(self) -> None:
         backoff = 1.0
@@ -1585,7 +1666,13 @@ class PiEdgeAgent:
             data = payload.get("Data")
             if not isinstance(data, list):
                 continue
-            readings.extend(item for item in data if isinstance(item, dict))
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                reading = dict(item)
+                if sent_at is not None:
+                    reading.setdefault("time", sent_at)
+                readings.append(reading)
 
         first_payload["Data"] = readings
         first_payload["agent_kind"] = "pi_edge_agent"
@@ -1597,6 +1684,15 @@ class PiEdgeAgent:
             "newest_payload_sent_at": max(queued_sent_at_values) if queued_sent_at_values else None,
         }
         return first_payload
+
+    async def send_upstream_payload(self, websocket: Any, outgoing: dict[str, Any], *, timeout_seconds: float = 15.0) -> dict[str, Any]:
+        outgoing["pi_health"] = self.health_payload()
+        await websocket.send(json.dumps(outgoing, separators=(",", ":")))
+        response_text = await asyncio.wait_for(websocket.recv(), timeout=timeout_seconds)
+        response = json.loads(response_text)
+        if not response.get("ok", False):
+            raise RuntimeError(str(response.get("error") or "Matador rejected Edge payload"))
+        return response
 
     async def stream_once(self) -> None:
         token = self.device_token
@@ -1610,23 +1706,32 @@ class PiEdgeAgent:
             while not self.stop_event.is_set() and self.streaming_enabled:
                 if self.upload_paused:
                     return
+                sent_live_payload = False
+                with suppress(asyncio.QueueEmpty):
+                    live_outgoing = self.live_payload_queue.get_nowait()
+                    await self.send_upstream_payload(websocket, dict(live_outgoing), timeout_seconds=5.0)
+                    self.increment_counter("upstream_live_payloads_sent")
+                    self.increment_counter("upstream_readings_sent", len(live_outgoing.get("Data") or []))
+                    self.state["last_upload_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                    self.save_state()
+                    sent_live_payload = True
                 rows = await asyncio.to_thread(
                     self.spool.peek_oldest_batch,
                     self.upload_batch_max_payloads,
                     self.upload_batch_max_readings,
                 )
                 if not rows:
+                    if sent_live_payload:
+                        continue
                     await asyncio.sleep(IDLE_SLEEP_SECONDS)
                     continue
                 payload_ids = [payload_id for payload_id, _ in rows]
                 outgoing = self.build_upload_payload(rows)
-                outgoing["pi_health"] = self.health_payload()
-                await websocket.send(json.dumps(outgoing, separators=(",", ":")))
-                response_text = await asyncio.wait_for(websocket.recv(), timeout=15)
-                response = json.loads(response_text)
-                if not response.get("ok", False):
+                try:
+                    await self.send_upstream_payload(websocket, outgoing)
+                except RuntimeError:
                     self.increment_counter("upstream_payloads_failed", len(rows))
-                    raise RuntimeError(str(response.get("error") or "Matador rejected Edge payload"))
+                    raise
                 await asyncio.to_thread(self.spool.ack_many, payload_ids)
                 self.increment_counter("upstream_batches_sent")
                 self.increment_counter("upstream_payloads_sent", len(rows))
@@ -1703,6 +1808,12 @@ def parse_args() -> argparse.Namespace:
         default=int(os.environ.get("MATADOR_PI_EDGE_SPOOL_MAX_PAYLOADS", os.environ.get("MATADOR_PI_EDGE_QUEUE_SIZE", str(SPOOL_MAX_PAYLOADS)))),
         help="Maximum durable outbound payloads to retain before oldest payloads are discarded. Set 0 for unlimited.",
     )
+    parser.add_argument(
+        "--storage-sample-hz",
+        type=float,
+        default=float(os.environ.get("MATADOR_PI_EDGE_STORAGE_SAMPLE_HZ", str(STORAGE_SAMPLE_HZ))),
+        help="Durable queue sampling rate for historical/export data. Default 1 Hz; set 0 to queue every GoFree payload.",
+    )
     parser.add_argument("--discover-once", action="store_true", help="Print discovered GoFree processors and exit")
     parser.add_argument("--log-level", default=os.environ.get("MATADOR_PI_EDGE_LOG_LEVEL", "INFO"), help="Python logging level")
     return parser.parse_args()
@@ -1734,6 +1845,7 @@ def main() -> None:
         processor_ping_timeout_seconds=args.processor_ping_timeout_seconds,
         upload_batch_max_readings=args.upload_batch_max_readings,
         upload_batch_max_payloads=args.upload_batch_max_payloads,
+        storage_sample_hz=args.storage_sample_hz,
     )
     try:
         asyncio.run(agent.run())

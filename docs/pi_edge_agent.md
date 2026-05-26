@@ -33,6 +33,10 @@ and remote diagnostics/maintenance from Matador Admin.
   `/edge/stream` endpoint.
 - Stores unsent payloads in a durable SQLite spool at
   `/var/lib/matador-pi-edge-agent/outbound-spool.sqlite3`.
+- Samples the durable offline spool to 1 Hz by default for historical/export
+  data, while live upstream payloads remain high-rate when the Pi is connected
+  to Matador. Override with `MATADOR_PI_EDGE_STORAGE_SAMPLE_HZ=0` only for
+  short diagnostic captures where every GoFree frame must be retained locally.
 - Keeps the durable spool unlimited by default so offline data is not dropped
   at an arbitrary row cap. Set `MATADOR_PI_EDGE_SPOOL_MAX_PAYLOADS` only if a
   deliberate field cap is required.
@@ -45,6 +49,9 @@ and remote diagnostics/maintenance from Matador Admin.
 - Reports current app version, hostname, local processor host, queue state,
   disk guard state, and update-result telemetry during config check-ins, so
   Admin remains fresh even when upstream uploads are paused.
+- Reports the configured historical storage sample rate in Pi health payloads
+  so support can confirm whether a Pi is using the production 1 Hz queue policy
+  or a temporary full-rate diagnostic mode.
 - Separates active queued payload bytes from SQLite spool file size, since the
   database file may remain large after a backlog has drained.
 - Keeps `/etc/hosts` in sync when first-boot hostname uniquing or remote
@@ -56,9 +63,13 @@ and remote diagnostics/maintenance from Matador Admin.
   `self_test`, `update_agent`, `reboot_system`, auto-update timer enable/disable,
   support-bundle capture, queue clearing, hostname update, reset/re-enrol, and
   GoFree rediscovery/reconnect.
+- Lets support download the latest captured support bundle from the Pi Support
+  page after a bundle has been collected and reported by the agent.
 - Shows server-queued command state in Pi diagnostics so admins can see whether
   `update_agent` and other commands are waiting for pickup or acknowledged by
   the Pi.
+- Shows token age and last token use in Pi Support so fleet support can see
+  whether a device token is current without querying the database manually.
 - Captures update output in `/var/lib/matador-pi-edge-agent/update.log`; the
   status script and Pi diagnostics page show the log tail and last result.
 - Reports disk pressure as `ok`, `warn`, or `critical` so support can spot a
@@ -68,9 +79,14 @@ and remote diagnostics/maintenance from Matador Admin.
   SSID, and hostname.
 - Self-test probes Matador `/edge/health` reachability so support can
   distinguish local processor issues from internet/server reachability issues.
-- Pi diagnostics include a Received Data panel showing latest Pi-backed
-  telemetry rows, metric freshness, source counts, and valid/invalid readings.
-- Pi diagnostics include a production acceptance checklist for final appliance
+- Source Diagnostics shows latest Pi-backed telemetry rows, metric freshness,
+  source counts, and valid/invalid readings. Pi Support intentionally avoids a
+  duplicate received-data panel and focuses on agent health and maintenance.
+- Source Diagnostics flags duplicate Pi Edge source locks when two or more
+  agents appear to be locked to the same GoFree processor identity.
+- Pi diagnostics show stale-reason guidance so support can distinguish Pi
+  offline, GoFree silence, paused uploads, queue backlog, and disk pressure.
+- This runbook includes a production acceptance checklist for final appliance
   sign-off before handover.
 - If no enrolment code is configured, phones home with a stable device ID and
   claim code so a Matador admin can approve the Pi from the Admin page.
@@ -177,8 +193,18 @@ outside the agent service cgroup. That lets the updater restart
 
 ## Production And Golden Images
 
-Fresh production install that is enabled for the customer first boot but does
-not phone home during preparation:
+Fresh install on a Pi that should phone home immediately for Admin approval:
+
+```bash
+cd /opt
+sudo git clone https://github.com/tom0r3/Matador-Pi-Edge-Agent.git matador-pi-edge-agent
+sudo chown -R "$USER:$USER" /opt/matador-pi-edge-agent
+cd /opt/matador-pi-edge-agent
+sudo ./scripts/install.sh
+```
+
+Production-prep install for a Pi or SD-card image that should be enabled for
+the customer's first boot, but must not phone home during preparation:
 
 ```bash
 cd /opt
@@ -211,8 +237,8 @@ sudo /opt/matador-pi-edge-agent/scripts/factory-reset.sh
 
 ## Production Acceptance Checklist
 
-Use the Pi diagnostics page as the final appliance sign-off point. For each
-new or updated Pi, confirm:
+Use this checklist while viewing the Pi diagnostics page for final appliance
+sign-off. For each new or updated Pi, confirm:
 
 - The Pi is approved to the correct team, has the expected processor name, and
   shows the correct processor role.
@@ -220,8 +246,9 @@ new or updated Pi, confirm:
   refresh/reconnect without falling back to a DHCP-only identity.
 - Live Health shows the expected Wi-Fi SSID, Pi IP address, default route, DNS
   servers, queue state, and Matador check-in freshness.
-- Received Data shows current metrics for the expected source, especially wind,
-  heading, GPS, COG, and SOG where those values are available on the vessel.
+- Source Diagnostics shows current metrics for the expected source, especially
+  wind, heading, GPS, COG, and SOG where those values are available on the
+  vessel.
 - Queue depth stays small when online, grows while uploads are paused/offline,
   and drains after uploads resume.
 - Remote commands are acknowledged and visible: Run Self-Test, Update Now,
