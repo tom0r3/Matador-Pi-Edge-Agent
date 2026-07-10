@@ -28,7 +28,7 @@ import websockets
 
 
 APP_NAME = "Matador Pi Edge Agent"
-DEFAULT_APP_VERSION = "3.5.8"
+DEFAULT_APP_VERSION = "3.5.9"
 DEFAULT_SERVER = "https://matador.torodatasystems.eu"
 GOFREE_DISCOVERY_GROUP = "239.2.1.1"
 GOFREE_DISCOVERY_PORTS = (2052, 2050)
@@ -56,6 +56,8 @@ GOFREE_DATA_INFO_METRIC_NAMES = {
     "COG",
     "HEADING",
     "TWD",
+    "DESTINATION_LAT",
+    "DESTINATION_LON",
     "START_LINE_BIAS",
     "START_LINE_BEARING",
     "MAG_VARIATION",
@@ -69,7 +71,12 @@ def resolve_app_version() -> str:
     env_version = os.environ.get("MATADOR_PI_EDGE_VERSION", "").strip()
     if env_version:
         return env_version
-    for version_path in (Path.cwd() / "VERSION", Path(__file__).resolve().parents[1] / "VERSION"):
+    for version_path in (
+        Path.cwd() / "PI_EDGE_AGENT_VERSION",
+        Path(__file__).resolve().parents[1] / "PI_EDGE_AGENT_VERSION",
+        Path.cwd() / "VERSION",
+        Path(__file__).resolve().parents[1] / "VERSION",
+    ):
         with suppress(OSError):
             version = version_path.read_text(encoding="utf-8").strip()
             if version:
@@ -78,6 +85,18 @@ def resolve_app_version() -> str:
 
 
 APP_VERSION = resolve_app_version()
+
+
+def expected_pi_agent_version(config: dict[str, Any] | None) -> str | None:
+    payload = config or {}
+    agent_versions = payload.get("agent_versions") if isinstance(payload.get("agent_versions"), dict) else {}
+    return (
+        str(payload.get("pi_agent_version") or "").strip()
+        or str(payload.get("latest_pi_agent_version") or "").strip()
+        or str(agent_versions.get("pi_edge") or "").strip()
+        or str(payload.get("server_version") or "").strip()
+        or None
+    )
 
 
 @dataclass(frozen=True)
@@ -1090,48 +1109,8 @@ class PiEdgeAgent:
         return rows
 
     def local_status_snapshot(self) -> dict[str, Any]:
-        errors: list[str] = []
-        try:
-            health = self.health_payload(include_support_bundle=False)
-        except Exception as exc:
-            LOGGER.warning("Local status health snapshot failed: %s", exc)
-            errors.append(f"health snapshot: {exc}")
-            health = {
-                "agent": {
-                    "kind": "pi_edge_agent",
-                    "name": APP_NAME,
-                    "version": APP_VERSION,
-                    "hostname": hostname(),
-                },
-                "controls": {
-                    "processor_enabled": self.processor_enabled,
-                    "streaming_enabled": self.streaming_enabled,
-                    "upload_paused": self.upload_paused,
-                    "historical_storage_sample_hz": self.storage_sample_hz,
-                },
-                "storage": {
-                    "state_dir": disk_stats(self.state_dir),
-                    "spool": {},
-                    "disk_guard": {"status": "unknown", "message": "Health snapshot failed"},
-                },
-                "network": {"hostname": hostname()},
-                "links": {
-                    "last_config_at": self.state.get("last_config_at") or None,
-                    "last_processor_data_at": self.state.get("last_processor_data_at") or None,
-                    "last_upstream_connected_at": self.state.get("last_upstream_connected_at") or None,
-                    "last_upload_at": self.state.get("last_upload_at") or None,
-                },
-                "counters": self.counters,
-                "last_discovered_processors": self.state.get("last_discovered_processors") or [],
-                "locked_processor_identity": self.locked_processor_identity(),
-                "lock_confidence": "unknown",
-            }
-        try:
-            subscribed = self.subscribed_metric_rows()
-        except Exception as exc:
-            LOGGER.warning("Local status subscribed metrics snapshot failed: %s", exc)
-            errors.append(f"subscribed metrics: {exc}")
-            subscribed = []
+        health = self.health_payload(include_support_bundle=False)
+        subscribed = self.subscribed_metric_rows()
         return {
             "generated_at": utc_timestamp(),
             "agent": health.get("agent") or {},
@@ -1149,7 +1128,6 @@ class PiEdgeAgent:
             "subscribed_metric_count": len(subscribed),
             "latest_value_count": len(self.latest_values_by_metric),
             "live_queue_size": self.live_payload_queue.qsize(),
-            "errors": errors,
         }
 
     def local_status_pill_class(self, value: Any) -> str:
@@ -1166,36 +1144,25 @@ class PiEdgeAgent:
         def esc(value: Any) -> str:
             return html.escape("-" if value is None else str(value))
 
-        def as_dict(value: Any) -> dict[str, Any]:
-            return value if isinstance(value, dict) else {}
-
-        def as_list(value: Any) -> list[Any]:
-            return value if isinstance(value, list) else []
-
-        def join_values(value: Any) -> str:
-            return ", ".join(str(item) for item in as_list(value))
-
-        agent = as_dict(snapshot.get("agent"))
-        health = as_dict(snapshot.get("health"))
-        controls = as_dict(health.get("controls"))
-        storage = as_dict(health.get("storage"))
-        spool = as_dict(storage.get("spool"))
-        disk = as_dict(storage.get("disk_guard"))
-        links = as_dict(health.get("links"))
-        network = as_dict(health.get("network"))
-        wifi = as_dict(network.get("wifi"))
-        default_route = as_dict(network.get("default_route"))
-        lock = as_dict(health.get("locked_processor_identity"))
-        connectivity = as_dict(snapshot.get("connectivity"))
+        agent = snapshot.get("agent") or {}
+        health = snapshot.get("health") or {}
+        controls = health.get("controls") or {}
+        storage = health.get("storage") or {}
+        spool = storage.get("spool") or {}
+        disk = storage.get("disk_guard") or {}
+        links = health.get("links") or {}
+        network = health.get("network") or {}
+        wifi = network.get("wifi") if isinstance(network.get("wifi"), dict) else {}
+        lock = health.get("locked_processor_identity") or {}
+        connectivity = snapshot.get("connectivity") or {}
 
         def pill(label: str, value: Any) -> str:
             css = self.local_status_pill_class(value)
             return f'<div class="pill {css}"><span>{esc(label)}</span><strong>{esc(value)}</strong></div>'
 
         metric_rows = []
-        for item in as_list(snapshot.get("subscribed_metrics")):
-            row = as_dict(item)
-            latest = as_dict(row.get("latest"))
+        for row in snapshot.get("subscribed_metrics") or []:
+            latest = row.get("latest") or {}
             age = human_duration(iso_age_seconds(latest.get("updated_at"))) if latest else "-"
             valid = latest.get("valid")
             valid_text = "-" if valid is None else "yes" if bool(valid) else "no"
@@ -1212,21 +1179,12 @@ class PiEdgeAgent:
             )
         metrics_html = "\n".join(metric_rows) or '<tr><td colspan="5">No subscribed metrics received yet.</td></tr>'
 
-        discovered = as_list(health.get("last_discovered_processors"))
+        discovered = health.get("last_discovered_processors") or []
         discovered_items = "\n".join(
             f"<li>{esc(item.get('name') or 'Processor')} - {esc(item.get('model'))} - {esc(item.get('serial_number'))} @ {esc(item.get('last_host'))}:{esc(item.get('port'))}</li>"
             for item in discovered
             if isinstance(item, dict)
         ) or "<li>No recent discovery results.</li>"
-        errors = as_list(snapshot.get("errors"))
-        errors_html = ""
-        if errors:
-            error_items = "".join(f"<li>{esc(error)}</li>" for error in errors)
-            errors_html = f"""
-    <div class="card full">
-      <h2>Status Page Warnings</h2>
-      <ul>{error_items}</ul>
-    </div>"""
 
         return f"""<!doctype html>
 <html lang="en">
@@ -1322,10 +1280,10 @@ class PiEdgeAgent:
     <div class="card">
       <h2>Pi Network</h2>
       <div class="kv">
-        <div>IP addresses</div><div>{esc(join_values(network.get("ip_addresses")))}</div>
-        <div>Default route</div><div>{esc(default_route.get("raw"))}</div>
+        <div>IP addresses</div><div>{esc(", ".join(network.get("ip_addresses") or []))}</div>
+        <div>Default route</div><div>{esc((network.get("default_route") or {}).get("raw"))}</div>
         <div>wlan0 SSID</div><div>{esc(wifi.get("ssid") or "-")}</div>
-        <div>DNS</div><div>{esc(join_values(network.get("dns_servers")))}</div>
+        <div>DNS</div><div>{esc(", ".join(network.get("dns_servers") or []))}</div>
       </div>
     </div>
     <div class="card wide">
@@ -1357,77 +1315,37 @@ class PiEdgeAgent:
     <div class="card full">
       <h2>Discovered GoFree Processors</h2>
       <ul>{discovered_items}</ul>
-    </div>{errors_html}
+    </div>
   </section>
-</main>
-</body>
-</html>"""
-
-    def render_local_status_error_html(self, exc: Exception) -> str:
-        message = html.escape(f"{type(exc).__name__}: {exc!s}" if str(exc) else type(exc).__name__)
-        return f"""<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Matador Pi Edge Local Status Error</title>
-  <style>
-    body {{ margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #071018; color: #eef6ff; }}
-    main {{ width: min(760px, calc(100% - 32px)); margin: 42px auto; background: #101a26; border: 1px solid #2d4054; border-radius: 18px; padding: 22px; }}
-    h1 {{ margin: 0 0 10px; font-size: 1.45rem; }}
-    p {{ color: #9db1c5; line-height: 1.5; }}
-    code {{ display: block; margin-top: 14px; padding: 14px; background: #071018; border: 1px solid #2d4054; border-radius: 12px; color: #fb7185; white-space: pre-wrap; }}
-  </style>
-</head>
-<body>
-<main>
-  <h1>Local status page error</h1>
-  <p>The Pi Edge Agent is running, but the local status page hit an internal rendering/request error. The full traceback is in the service journal.</p>
-  <code>{message}</code>
 </main>
 </body>
 </html>"""
 
     async def write_local_status_response(self, writer: asyncio.StreamWriter, status: str, content_type: str, body: str) -> None:
         encoded = body.encode("utf-8")
-        try:
-            writer.write(
-                (
-                    f"HTTP/1.1 {status}\r\n"
-                    f"Content-Type: {content_type}; charset=utf-8\r\n"
-                    f"Content-Length: {len(encoded)}\r\n"
-                    "Cache-Control: no-store\r\n"
-                    "Connection: close\r\n\r\n"
-                ).encode("ascii")
-                + encoded
-            )
-            await writer.drain()
-        finally:
-            writer.close()
-            with suppress(Exception):
-                await writer.wait_closed()
+        writer.write(
+            (
+                f"HTTP/1.1 {status}\r\n"
+                f"Content-Type: {content_type}; charset=utf-8\r\n"
+                f"Content-Length: {len(encoded)}\r\n"
+                "Cache-Control: no-store\r\n"
+                "Connection: close\r\n\r\n"
+            ).encode("ascii")
+            + encoded
+        )
+        await writer.drain()
+        writer.close()
+        with suppress(Exception):
+            await writer.wait_closed()
 
     async def handle_local_status_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
-            request = await asyncio.wait_for(reader.read(8192), timeout=3.0)
-            request_lines = request.decode("iso-8859-1", errors="ignore").splitlines()
-            if not request_lines:
-                writer.close()
-                with suppress(Exception):
-                    await writer.wait_closed()
-                return
-            request_line = request_lines[0]
-            parts = request_line.split(" ", 2)
-            if len(parts) < 2:
-                await self.write_local_status_response(writer, "400 Bad Request", "text/plain", "Bad request")
-                return
-            method, target = parts[0], parts[1]
-            path = target.split("?", 1)[0] or "/"
+            request = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=3.0)
+            request_line = request.decode("iso-8859-1", errors="ignore").splitlines()[0]
+            method, target, _ = (request_line.split(" ", 2) + ["", ""])[:3]
+            path = target.split("?", 1)[0]
             if method.upper() != "GET":
                 await self.write_local_status_response(writer, "405 Method Not Allowed", "text/plain", "Method not allowed")
-                return
-            if path == "/favicon.ico":
-                await self.write_local_status_response(writer, "404 Not Found", "text/plain", "Not found")
                 return
             snapshot = self.local_status_snapshot()
             if path in {"/api/status", "/status.json"}:
@@ -1439,21 +1357,10 @@ class PiEdgeAgent:
                 await self.write_local_status_response(writer, "200 OK", "text/html", self.render_local_status_html(snapshot))
             else:
                 await self.write_local_status_response(writer, "404 Not Found", "text/plain", "Not found")
-        except asyncio.TimeoutError as exc:
-            # Browsers can open speculative/preload sockets and send no request.
-            # Treat that as a quiet disconnect, not as a local status page error.
-            LOGGER.debug("Local status client sent no request before timeout: %r", exc)
-            writer.close()
-            with suppress(Exception):
-                await writer.wait_closed()
-        except (BrokenPipeError, ConnectionResetError) as exc:
-            LOGGER.debug("Local status client disconnected before response completed: %r", exc)
-        except asyncio.CancelledError:
-            raise
         except Exception as exc:
-            LOGGER.warning("Local status request failed", exc_info=True)
+            LOGGER.debug("Local status request failed: %s", exc)
             with suppress(Exception):
-                await self.write_local_status_response(writer, "500 Internal Server Error", "text/html", self.render_local_status_error_html(exc))
+                await self.write_local_status_response(writer, "500 Internal Server Error", "text/plain", "Local status error")
 
     async def local_status_loop(self) -> None:
         if self.local_status_port <= 0:
@@ -1494,13 +1401,15 @@ class PiEdgeAgent:
         except Exception as exc:
             add("Queue database", "fail", str(exc))
 
-        server_version = (self.config() or {}).get("server_version")
-        update_available = bool(server_version and server_version != APP_VERSION)
+        current_config = self.config() or {}
+        server_version = current_config.get("matador_server_version") or current_config.get("server_version")
+        agent_version = expected_pi_agent_version(current_config)
+        update_available = bool(agent_version and agent_version != APP_VERSION)
         add(
             "Agent version",
             "warn" if update_available else "pass",
-            f"local {APP_VERSION}; server {server_version or 'unknown'}",
-            {"update_available": update_available},
+            f"local {APP_VERSION}; expected {agent_version or 'unknown'}; server {server_version or 'unknown'}",
+            {"update_available": update_available, "latest_agent_version": agent_version},
         )
 
         timer = self.update_timer_state(force=True)
@@ -1798,7 +1707,9 @@ class PiEdgeAgent:
         queue_eta_seconds = (pending / upload_rate) if pending and upload_rate and upload_rate > 0 else None
         lock = self.locked_processor_identity()
         serial = normalized_serial_number((lock or {}).get("serial_number")) if lock else ""
-        server_version = (self.config() or {}).get("server_version")
+        current_config = self.config() or {}
+        server_version = current_config.get("matador_server_version") or current_config.get("server_version")
+        agent_version = expected_pi_agent_version(current_config)
         lock_confidence = (
             "serial"
             if serial
@@ -1815,7 +1726,8 @@ class PiEdgeAgent:
                 "version": APP_VERSION,
                 "hostname": hostname(),
                 "latest_server_version": server_version,
-                "update_available": bool(server_version and server_version != APP_VERSION),
+                "latest_agent_version": agent_version,
+                "update_available": bool(agent_version and agent_version != APP_VERSION),
                 "hostname_uniqued_at": self.state.get("hostname_uniqued_at") or None,
                 "hostname_uniqued_from": self.state.get("hostname_uniqued_from") or None,
                 "hostname_uniquing_error": self.state.get("hostname_uniquing_error") or None,
@@ -2012,6 +1924,8 @@ class PiEdgeAgent:
 
     def update_data_info(self, payload: dict[str, Any]) -> bool:
         data_info = payload.get("DataInfo")
+        if isinstance(data_info, dict):
+            data_info = [data_info]
         if not isinstance(data_info, list):
             return False
         updated = False
@@ -2027,6 +1941,8 @@ class PiEdgeAgent:
 
     def update_settings(self, payload: dict[str, Any]) -> bool:
         settings = payload.get("Setting")
+        if isinstance(settings, dict):
+            settings = [settings]
         if not isinstance(settings, list):
             return False
         updated = False
@@ -2053,11 +1969,12 @@ class PiEdgeAgent:
         setting = self.setting_by_id.get(GOFREE_COMPASS_TRUE_MAG_SETTING_ID)
         if not setting:
             return None
-        value = int_or_none(setting.get("value"))
-        if value == 0:
-            return "magnetic"
-        if value == 1:
-            return "true"
+        for key in ("value", "val", "current"):
+            value = int_or_none(setting.get(key))
+            if value == 0:
+                return "magnetic"
+            if value == 1:
+                return "true"
         return None
 
     def enrich_data_item(self, item: dict[str, Any]) -> dict[str, Any]:
@@ -2155,6 +2072,7 @@ class PiEdgeAgent:
                 outgoing = {
                     "agent_kind": "pi_edge_agent",
                     "app_version": APP_VERSION,
+                    "client_hostname": hostname(),
                     "processor_host": processor_host,
                     "processor_identity": self.current_processor_identity or None,
                     "sent_at": time.time(),
@@ -2222,6 +2140,7 @@ class PiEdgeAgent:
         first_payload["Data"] = readings
         first_payload["agent_kind"] = "pi_edge_agent"
         first_payload["app_version"] = APP_VERSION
+        first_payload["client_hostname"] = hostname()
         first_payload["payload_batch"] = {
             "payload_count": len(rows),
             "reading_count": len(readings),
