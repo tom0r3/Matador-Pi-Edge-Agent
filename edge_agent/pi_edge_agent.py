@@ -1166,25 +1166,36 @@ class PiEdgeAgent:
         def esc(value: Any) -> str:
             return html.escape("-" if value is None else str(value))
 
-        agent = snapshot.get("agent") or {}
-        health = snapshot.get("health") or {}
-        controls = health.get("controls") or {}
-        storage = health.get("storage") or {}
-        spool = storage.get("spool") or {}
-        disk = storage.get("disk_guard") or {}
-        links = health.get("links") or {}
-        network = health.get("network") or {}
-        wifi = network.get("wifi") if isinstance(network.get("wifi"), dict) else {}
-        lock = health.get("locked_processor_identity") or {}
-        connectivity = snapshot.get("connectivity") or {}
+        def as_dict(value: Any) -> dict[str, Any]:
+            return value if isinstance(value, dict) else {}
+
+        def as_list(value: Any) -> list[Any]:
+            return value if isinstance(value, list) else []
+
+        def join_values(value: Any) -> str:
+            return ", ".join(str(item) for item in as_list(value))
+
+        agent = as_dict(snapshot.get("agent"))
+        health = as_dict(snapshot.get("health"))
+        controls = as_dict(health.get("controls"))
+        storage = as_dict(health.get("storage"))
+        spool = as_dict(storage.get("spool"))
+        disk = as_dict(storage.get("disk_guard"))
+        links = as_dict(health.get("links"))
+        network = as_dict(health.get("network"))
+        wifi = as_dict(network.get("wifi"))
+        default_route = as_dict(network.get("default_route"))
+        lock = as_dict(health.get("locked_processor_identity"))
+        connectivity = as_dict(snapshot.get("connectivity"))
 
         def pill(label: str, value: Any) -> str:
             css = self.local_status_pill_class(value)
             return f'<div class="pill {css}"><span>{esc(label)}</span><strong>{esc(value)}</strong></div>'
 
         metric_rows = []
-        for row in snapshot.get("subscribed_metrics") or []:
-            latest = row.get("latest") or {}
+        for item in as_list(snapshot.get("subscribed_metrics")):
+            row = as_dict(item)
+            latest = as_dict(row.get("latest"))
             age = human_duration(iso_age_seconds(latest.get("updated_at"))) if latest else "-"
             valid = latest.get("valid")
             valid_text = "-" if valid is None else "yes" if bool(valid) else "no"
@@ -1201,13 +1212,13 @@ class PiEdgeAgent:
             )
         metrics_html = "\n".join(metric_rows) or '<tr><td colspan="5">No subscribed metrics received yet.</td></tr>'
 
-        discovered = health.get("last_discovered_processors") or []
+        discovered = as_list(health.get("last_discovered_processors"))
         discovered_items = "\n".join(
             f"<li>{esc(item.get('name') or 'Processor')} - {esc(item.get('model'))} - {esc(item.get('serial_number'))} @ {esc(item.get('last_host'))}:{esc(item.get('port'))}</li>"
             for item in discovered
             if isinstance(item, dict)
         ) or "<li>No recent discovery results.</li>"
-        errors = snapshot.get("errors") or []
+        errors = as_list(snapshot.get("errors"))
         errors_html = ""
         if errors:
             error_items = "".join(f"<li>{esc(error)}</li>" for error in errors)
@@ -1311,10 +1322,10 @@ class PiEdgeAgent:
     <div class="card">
       <h2>Pi Network</h2>
       <div class="kv">
-        <div>IP addresses</div><div>{esc(", ".join(network.get("ip_addresses") or []))}</div>
-        <div>Default route</div><div>{esc((network.get("default_route") or {}).get("raw"))}</div>
+        <div>IP addresses</div><div>{esc(join_values(network.get("ip_addresses")))}</div>
+        <div>Default route</div><div>{esc(default_route.get("raw"))}</div>
         <div>wlan0 SSID</div><div>{esc(wifi.get("ssid") or "-")}</div>
-        <div>DNS</div><div>{esc(", ".join(network.get("dns_servers") or []))}</div>
+        <div>DNS</div><div>{esc(join_values(network.get("dns_servers")))}</div>
       </div>
     </div>
     <div class="card wide">
@@ -1352,22 +1363,49 @@ class PiEdgeAgent:
 </body>
 </html>"""
 
+    def render_local_status_error_html(self, exc: Exception) -> str:
+        message = html.escape(f"{type(exc).__name__}: {exc!s}" if str(exc) else type(exc).__name__)
+        return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Matador Pi Edge Local Status Error</title>
+  <style>
+    body {{ margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #071018; color: #eef6ff; }}
+    main {{ width: min(760px, calc(100% - 32px)); margin: 42px auto; background: #101a26; border: 1px solid #2d4054; border-radius: 18px; padding: 22px; }}
+    h1 {{ margin: 0 0 10px; font-size: 1.45rem; }}
+    p {{ color: #9db1c5; line-height: 1.5; }}
+    code {{ display: block; margin-top: 14px; padding: 14px; background: #071018; border: 1px solid #2d4054; border-radius: 12px; color: #fb7185; white-space: pre-wrap; }}
+  </style>
+</head>
+<body>
+<main>
+  <h1>Local status page error</h1>
+  <p>The Pi Edge Agent is running, but the local status page hit an internal rendering/request error. The full traceback is in the service journal.</p>
+  <code>{message}</code>
+</main>
+</body>
+</html>"""
+
     async def write_local_status_response(self, writer: asyncio.StreamWriter, status: str, content_type: str, body: str) -> None:
         encoded = body.encode("utf-8")
-        writer.write(
-            (
-                f"HTTP/1.1 {status}\r\n"
-                f"Content-Type: {content_type}; charset=utf-8\r\n"
-                f"Content-Length: {len(encoded)}\r\n"
-                "Cache-Control: no-store\r\n"
-                "Connection: close\r\n\r\n"
-            ).encode("ascii")
-            + encoded
-        )
-        await writer.drain()
-        writer.close()
-        with suppress(Exception):
-            await writer.wait_closed()
+        try:
+            writer.write(
+                (
+                    f"HTTP/1.1 {status}\r\n"
+                    f"Content-Type: {content_type}; charset=utf-8\r\n"
+                    f"Content-Length: {len(encoded)}\r\n"
+                    "Cache-Control: no-store\r\n"
+                    "Connection: close\r\n\r\n"
+                ).encode("ascii")
+                + encoded
+            )
+            await writer.drain()
+        finally:
+            writer.close()
+            with suppress(Exception):
+                await writer.wait_closed()
 
     async def handle_local_status_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
@@ -1384,9 +1422,12 @@ class PiEdgeAgent:
                 await self.write_local_status_response(writer, "400 Bad Request", "text/plain", "Bad request")
                 return
             method, target = parts[0], parts[1]
-            path = target.split("?", 1)[0]
+            path = target.split("?", 1)[0] or "/"
             if method.upper() != "GET":
                 await self.write_local_status_response(writer, "405 Method Not Allowed", "text/plain", "Method not allowed")
+                return
+            if path == "/favicon.ico":
+                await self.write_local_status_response(writer, "404 Not Found", "text/plain", "Not found")
                 return
             snapshot = self.local_status_snapshot()
             if path in {"/api/status", "/status.json"}:
@@ -1398,10 +1439,14 @@ class PiEdgeAgent:
                 await self.write_local_status_response(writer, "200 OK", "text/html", self.render_local_status_html(snapshot))
             else:
                 await self.write_local_status_response(writer, "404 Not Found", "text/plain", "Not found")
+        except (BrokenPipeError, ConnectionResetError) as exc:
+            LOGGER.debug("Local status client disconnected before response completed: %r", exc)
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
-            LOGGER.warning("Local status request failed: %s", exc)
+            LOGGER.warning("Local status request failed", exc_info=True)
             with suppress(Exception):
-                await self.write_local_status_response(writer, "500 Internal Server Error", "text/plain", "Local status error")
+                await self.write_local_status_response(writer, "500 Internal Server Error", "text/html", self.render_local_status_error_html(exc))
 
     async def local_status_loop(self) -> None:
         if self.local_status_port <= 0:

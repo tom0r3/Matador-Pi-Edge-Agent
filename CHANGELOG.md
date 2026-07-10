@@ -10,6 +10,9 @@ All notable project changes will be recorded here.
 - Hardened the local Pi Edge health page so transient snapshot/render failures
   show as page warnings and normal service logs instead of returning a generic
   `Local status error`.
+- Changed the local Pi Edge health page request handler to ignore normal browser
+  disconnects, log full tracebacks for genuine page errors, and render an
+  explanatory local error page if an internal status-page failure still occurs.
 
 ## 2026-05-19 - Version 3.5.2
 
