@@ -17,6 +17,18 @@ All notable project changes will be recorded here.
   so they are closed quietly instead of being rendered as a visible
   `TimeoutError` page.
 
+## 2026-07-10 - Version 3.5.9
+
+- Accepted GoFree `DataInfo` and `Setting` replies delivered either as a list
+  or as a single object.
+- Accepted the `value`, `val`, and `current` setting fields when reading the
+  GoFree true/magnetic compass reference.
+- Preserved the source `degT` or `degM` reference alongside TWD, heading, and
+  start-line bearing telemetry so Matador can convert user-selected true and
+  magnetic dashboard views safely.
+- Corrected the standalone Pi Agent development checks so they validate only
+  files that are part of this repository.
+
 ## 2026-05-19 - Version 3.5.2
 
 - Added the Stage 3 Pi Edge Agent no-code claiming path: unconfigured Pi agents can phone home with a stable claim code, appear in the Admin page, and be approved into a team/processor without typing an enrolment code on the device.

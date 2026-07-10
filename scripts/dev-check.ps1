@@ -46,11 +46,6 @@ $Python = Find-Executable @(
   "$env:USERPROFILE\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe",
   "python"
 )
-$Node = Find-Executable @(
-  $env:MATADOR_DEV_NODE,
-  "$env:USERPROFILE\.cache\codex-runtimes\codex-primary-runtime\dependencies\node\bin\node.exe",
-  "node"
-)
 $Bash = Find-Executable @(
   $env:MATADOR_DEV_BASH,
   "C:\Program Files\Git\bin\bash.exe",
@@ -63,32 +58,13 @@ if (-not $SkipPython) {
   Invoke-Native $Python @(
     "-m",
     "py_compile",
-    "edge_agent\pi_edge_agent.py",
-    "gofree_collector\dashboard.py",
-    "gofree_collector\edge_ingest.py"
+    "edge_agent\pi_edge_agent.py"
   )
 }
 
 if (-not $SkipJs) {
-  if (-not $Node) { throw "Node.js not found. Set MATADOR_DEV_NODE or install Node.js." }
-  Write-Step "Embedded browser JavaScript parse"
-  $script = @'
-const fs = require("fs");
-const files = ["web/nextindex.html", "web/pi_edge_diagnostics.html", "web/admin.html", "web/diagnostics.html", "web/sql.html"];
-for (const file of files) {
-  const html = fs.readFileSync(file, "utf8");
-  const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((match) => match[1]);
-  for (const source of scripts) new Function(source);
-  console.log(`${file}: ${scripts.length} script block(s) ok`);
-}
-'@
-  $tempScript = Join-Path ([System.IO.Path]::GetTempPath()) "matador-dev-check-js-$PID.js"
-  try {
-    Set-Content -LiteralPath $tempScript -Value $script -Encoding UTF8
-    Invoke-Native $Node @($tempScript)
-  } finally {
-    Remove-Item -LiteralPath $tempScript -ErrorAction SilentlyContinue
-  }
+  Write-Step "Browser JavaScript parse"
+  Write-Host "No browser JavaScript in the standalone Pi Agent repository."
 }
 
 if (-not $SkipShell) {
@@ -111,18 +87,9 @@ if (-not $SkipDiffCheck) {
       "--check",
       "--",
       "edge_agent/pi_edge_agent.py",
-      "gofree_collector/dashboard.py",
-      "gofree_collector/edge_ingest.py",
-      "web/nextindex.html",
-      "web/pi_edge_diagnostics.html",
-      "web/admin.html",
-      "web/diagnostics.html",
-      "web/sql.html",
       "README.md",
       "CHANGELOG.md",
-      "docs/edge_agent.md",
-      "docs/pi_edge_agent.md",
-      "docs/sql_admin.md",
+      "VERSION",
       "scripts/update.sh",
       "scripts/install.sh",
       "scripts/status.sh",
