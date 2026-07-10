@@ -7,6 +7,9 @@ All notable project changes will be recorded here.
 - Added a lightweight local Pi Edge health web page on port `8080` with
   connectivity, queue, Pi health, processor lock, discovery, and subscribed
   metric status, plus JSON endpoints at `/api/status` and `/health`.
+- Hardened the local Pi Edge health page so transient snapshot/render failures
+  show as page warnings and normal service logs instead of returning a generic
+  `Local status error`.
 
 ## 2026-05-19 - Version 3.5.2
 

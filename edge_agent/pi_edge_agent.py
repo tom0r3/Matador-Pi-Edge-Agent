@@ -1090,8 +1090,48 @@ class PiEdgeAgent:
         return rows
 
     def local_status_snapshot(self) -> dict[str, Any]:
-        health = self.health_payload(include_support_bundle=False)
-        subscribed = self.subscribed_metric_rows()
+        errors: list[str] = []
+        try:
+            health = self.health_payload(include_support_bundle=False)
+        except Exception as exc:
+            LOGGER.warning("Local status health snapshot failed: %s", exc)
+            errors.append(f"health snapshot: {exc}")
+            health = {
+                "agent": {
+                    "kind": "pi_edge_agent",
+                    "name": APP_NAME,
+                    "version": APP_VERSION,
+                    "hostname": hostname(),
+                },
+                "controls": {
+                    "processor_enabled": self.processor_enabled,
+                    "streaming_enabled": self.streaming_enabled,
+                    "upload_paused": self.upload_paused,
+                    "historical_storage_sample_hz": self.storage_sample_hz,
+                },
+                "storage": {
+                    "state_dir": disk_stats(self.state_dir),
+                    "spool": {},
+                    "disk_guard": {"status": "unknown", "message": "Health snapshot failed"},
+                },
+                "network": {"hostname": hostname()},
+                "links": {
+                    "last_config_at": self.state.get("last_config_at") or None,
+                    "last_processor_data_at": self.state.get("last_processor_data_at") or None,
+                    "last_upstream_connected_at": self.state.get("last_upstream_connected_at") or None,
+                    "last_upload_at": self.state.get("last_upload_at") or None,
+                },
+                "counters": self.counters,
+                "last_discovered_processors": self.state.get("last_discovered_processors") or [],
+                "locked_processor_identity": self.locked_processor_identity(),
+                "lock_confidence": "unknown",
+            }
+        try:
+            subscribed = self.subscribed_metric_rows()
+        except Exception as exc:
+            LOGGER.warning("Local status subscribed metrics snapshot failed: %s", exc)
+            errors.append(f"subscribed metrics: {exc}")
+            subscribed = []
         return {
             "generated_at": utc_timestamp(),
             "agent": health.get("agent") or {},
@@ -1109,6 +1149,7 @@ class PiEdgeAgent:
             "subscribed_metric_count": len(subscribed),
             "latest_value_count": len(self.latest_values_by_metric),
             "live_queue_size": self.live_payload_queue.qsize(),
+            "errors": errors,
         }
 
     def local_status_pill_class(self, value: Any) -> str:
@@ -1166,6 +1207,15 @@ class PiEdgeAgent:
             for item in discovered
             if isinstance(item, dict)
         ) or "<li>No recent discovery results.</li>"
+        errors = snapshot.get("errors") or []
+        errors_html = ""
+        if errors:
+            error_items = "".join(f"<li>{esc(error)}</li>" for error in errors)
+            errors_html = f"""
+    <div class="card full">
+      <h2>Status Page Warnings</h2>
+      <ul>{error_items}</ul>
+    </div>"""
 
         return f"""<!doctype html>
 <html lang="en">
@@ -1296,7 +1346,7 @@ class PiEdgeAgent:
     <div class="card full">
       <h2>Discovered GoFree Processors</h2>
       <ul>{discovered_items}</ul>
-    </div>
+    </div>{errors_html}
   </section>
 </main>
 </body>
@@ -1321,9 +1371,19 @@ class PiEdgeAgent:
 
     async def handle_local_status_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
-            request = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=3.0)
-            request_line = request.decode("iso-8859-1", errors="ignore").splitlines()[0]
-            method, target, _ = (request_line.split(" ", 2) + ["", ""])[:3]
+            request = await asyncio.wait_for(reader.read(8192), timeout=3.0)
+            request_lines = request.decode("iso-8859-1", errors="ignore").splitlines()
+            if not request_lines:
+                writer.close()
+                with suppress(Exception):
+                    await writer.wait_closed()
+                return
+            request_line = request_lines[0]
+            parts = request_line.split(" ", 2)
+            if len(parts) < 2:
+                await self.write_local_status_response(writer, "400 Bad Request", "text/plain", "Bad request")
+                return
+            method, target = parts[0], parts[1]
             path = target.split("?", 1)[0]
             if method.upper() != "GET":
                 await self.write_local_status_response(writer, "405 Method Not Allowed", "text/plain", "Method not allowed")
@@ -1339,7 +1399,7 @@ class PiEdgeAgent:
             else:
                 await self.write_local_status_response(writer, "404 Not Found", "text/plain", "Not found")
         except Exception as exc:
-            LOGGER.debug("Local status request failed: %s", exc)
+            LOGGER.warning("Local status request failed: %s", exc)
             with suppress(Exception):
                 await self.write_local_status_response(writer, "500 Internal Server Error", "text/plain", "Local status error")
 

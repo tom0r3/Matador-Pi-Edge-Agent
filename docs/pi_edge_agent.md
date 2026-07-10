@@ -84,7 +84,8 @@ and remote diagnostics/maintenance from Matador Admin.
 - Serves a lightweight local health page on port `8080` by default, showing
   Pi health, Matador/GoFree connectivity, queue state, processor lock,
   discovered processors, and latest subscribed metric values. The same data is
-  available as JSON from `/api/status`.
+  available as JSON from `/api/status`. Snapshot failures are shown as page
+  warnings and service log warnings rather than taking the whole page down.
 - Self-test probes Matador `/edge/health` reachability so support can
   distinguish local processor issues from internet/server reachability issues.
 - Source Diagnostics shows latest Pi-backed telemetry rows, metric freshness,
