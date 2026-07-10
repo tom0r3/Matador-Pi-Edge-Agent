@@ -1439,6 +1439,13 @@ class PiEdgeAgent:
                 await self.write_local_status_response(writer, "200 OK", "text/html", self.render_local_status_html(snapshot))
             else:
                 await self.write_local_status_response(writer, "404 Not Found", "text/plain", "Not found")
+        except asyncio.TimeoutError as exc:
+            # Browsers can open speculative/preload sockets and send no request.
+            # Treat that as a quiet disconnect, not as a local status page error.
+            LOGGER.debug("Local status client sent no request before timeout: %r", exc)
+            writer.close()
+            with suppress(Exception):
+                await writer.wait_closed()
         except (BrokenPipeError, ConnectionResetError) as exc:
             LOGGER.debug("Local status client disconnected before response completed: %r", exc)
         except asyncio.CancelledError:

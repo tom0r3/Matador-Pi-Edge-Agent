@@ -86,8 +86,9 @@ and remote diagnostics/maintenance from Matador Admin.
   discovered processors, and latest subscribed metric values. The same data is
   available as JSON from `/api/status`. Snapshot failures are shown as page
   warnings and service log warnings rather than taking the whole page down.
-  Normal browser/preload disconnects are ignored, while genuine local-page
-  failures are logged with a traceback and shown as an explanatory error page.
+  Normal browser/preload disconnects and speculative sockets that send no
+  request are ignored, while genuine local-page failures are logged with a
+  traceback and shown as an explanatory error page.
 - Self-test probes Matador `/edge/health` reachability so support can
   distinguish local processor issues from internet/server reachability issues.
 - Source Diagnostics shows latest Pi-backed telemetry rows, metric freshness,

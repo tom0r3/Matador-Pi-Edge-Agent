@@ -36,7 +36,8 @@ values. `/api/status` returns the same snapshot as JSON and `/health` returns a
 compact health response. If a live diagnostic section cannot be read, the page
 stays available and shows a warning instead of failing completely. Set
 `MATADOR_PI_EDGE_LOCAL_STATUS_PORT=0` to disable the local page on installations
-where it is not wanted. Browser refresh/preload disconnects are ignored, and any
-genuine local-page rendering error is logged with a traceback in
+where it is not wanted. Browser refresh/preload disconnects and speculative
+connections that send no request are ignored, and any genuine local-page
+rendering error is logged with a traceback in
 `journalctl -u matador-pi-edge-agent.service`.
 

@@ -13,6 +13,9 @@ All notable project changes will be recorded here.
 - Changed the local Pi Edge health page request handler to ignore normal browser
   disconnects, log full tracebacks for genuine page errors, and render an
   explanatory local error page if an internal status-page failure still occurs.
+- Fixed browser speculative/preload sockets timing out before sending a request
+  so they are closed quietly instead of being rendered as a visible
+  `TimeoutError` page.
 
 ## 2026-05-19 - Version 3.5.2
 
