@@ -4,6 +4,10 @@ All notable project changes will be recorded here.
 
 ## Unreleased
 
+- Added a lightweight local Pi Edge health web page on port `8080` with
+  connectivity, queue, Pi health, processor lock, discovery, and subscribed
+  metric status, plus JSON endpoints at `/api/status` and `/health`.
+
 ## 2026-05-19 - Version 3.5.2
 
 - Added the Stage 3 Pi Edge Agent no-code claiming path: unconfigured Pi agents can phone home with a stable claim code, appear in the Admin page, and be approved into a team/processor without typing an enrolment code on the device.

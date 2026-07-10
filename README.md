@@ -29,3 +29,10 @@ device ID and claim code. A global admin can approve the pending Pi from the
 Admin page, choose the destination team, processor name, and processor role, and
 the Pi will pick up its authorized config on the next poll.
 
+Pi appliances also expose a local health page at `http://<pi-ip>:8080/` by
+default. It shows Matador/GoFree connectivity, queue state, Pi network/storage
+health, processor lock, discovered processors, and latest subscribed metric
+values. `/api/status` returns the same snapshot as JSON and `/health` returns a
+compact health response. Set `MATADOR_PI_EDGE_LOCAL_STATUS_PORT=0` to disable
+the local page on installations where it is not wanted.
+

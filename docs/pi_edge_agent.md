@@ -81,6 +81,10 @@ and remote diagnostics/maintenance from Matador Admin.
 - Reports local network diagnostics in health payloads, including Pi IP
   addresses, default route, interface addresses, DNS servers, active `wlan0`
   SSID, and hostname.
+- Serves a lightweight local health page on port `8080` by default, showing
+  Pi health, Matador/GoFree connectivity, queue state, processor lock,
+  discovered processors, and latest subscribed metric values. The same data is
+  available as JSON from `/api/status`.
 - Self-test probes Matador `/edge/health` reachability so support can
   distinguish local processor issues from internet/server reachability issues.
 - Source Diagnostics shows latest Pi-backed telemetry rows, metric freshness,
@@ -138,6 +142,8 @@ MATADOR_PI_EDGE_PROCESSOR_PING_TIMEOUT_SECONDS=15
 MATADOR_PI_EDGE_DATA_SILENCE_RECONNECT_SECONDS=90
 MATADOR_PI_EDGE_UPLOAD_BATCH_MAX_READINGS=250
 MATADOR_PI_EDGE_UPLOAD_BATCH_MAX_PAYLOADS=50
+MATADOR_PI_EDGE_LOCAL_STATUS_HOST=0.0.0.0
+MATADOR_PI_EDGE_LOCAL_STATUS_PORT=8080
 MATADOR_PI_EDGE_LOG_LEVEL=INFO
 ```
 
@@ -166,6 +172,22 @@ Check local status:
 ```bash
 sudo /opt/matador-pi-edge-agent/scripts/status.sh
 ```
+
+Open the local Pi health page from a browser on the same network:
+
+```text
+http://<pi-ip>:8080/
+```
+
+Useful local status endpoints:
+
+- `/` shows the human-readable status page.
+- `/api/status` returns the same operational snapshot as JSON.
+- `/health` returns a compact JSON health response.
+
+Set `MATADOR_PI_EDGE_LOCAL_STATUS_PORT=0` in
+`/etc/matador-pi-edge-agent.env` and restart the service if a local web page is
+not wanted on a particular installation.
 
 Update from GitHub:
 

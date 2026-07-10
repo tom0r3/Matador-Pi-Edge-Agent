@@ -86,6 +86,7 @@ echo "  sudo journalctl -u $SERVICE_NAME -f"
 echo
 echo "Check local status with:"
 echo "  sudo $APP_DIR/scripts/status.sh"
+echo "  http://<pi-ip>:8080/"
 echo
 echo "Optional daily updates can be enabled with:"
 echo "  sudo systemctl enable --now matador-pi-edge-update.timer"

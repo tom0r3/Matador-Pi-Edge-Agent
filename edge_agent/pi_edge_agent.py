@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import calendar
 import hashlib
+import html
 import json
 import logging
 import os
@@ -39,6 +41,8 @@ UPLOAD_BATCH_MAX_PAYLOADS = 50
 STORAGE_SAMPLE_HZ = 1.0
 GOLDEN_IMAGE_HOSTNAME_MARKER = "golden-image-hostname.pending"
 SPOOL_MAX_PAYLOADS = 0
+LOCAL_STATUS_HOST = "0.0.0.0"
+LOCAL_STATUS_PORT = 8080
 DISK_WARN_USED_PERCENT = 70.0
 DISK_CRITICAL_USED_PERCENT = 85.0
 DISK_STOP_BUFFERING_USED_PERCENT = 95.0
@@ -278,6 +282,44 @@ def float_or_none(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def utc_timestamp() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def human_duration(seconds: Any) -> str:
+    value = float_or_none(seconds)
+    if value is None:
+        return "-"
+    value = max(0, int(value))
+    if value < 60:
+        return f"{value}s"
+    minutes, sec = divmod(value, 60)
+    if minutes < 60:
+        return f"{minutes}m {sec}s"
+    hours, minute = divmod(minutes, 60)
+    if hours < 48:
+        return f"{hours}h {minute}m"
+    days, hour = divmod(hours, 24)
+    return f"{days}d {hour}h"
+
+
+def iso_age_seconds(value: Any) -> float | None:
+    if not value:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        if text.endswith("Z"):
+            parsed = time.strptime(text, "%Y-%m-%dT%H:%M:%SZ")
+            timestamp = calendar.timegm(parsed)
+        else:
+            return None
+    except ValueError:
+        return None
+    return max(0.0, time.time() - timestamp)
 
 
 def normalized_serial_number(value: Any) -> str:
@@ -582,6 +624,8 @@ class PiEdgeAgent:
         upload_batch_max_readings: int,
         upload_batch_max_payloads: int,
         storage_sample_hz: float,
+        local_status_host: str,
+        local_status_port: int,
     ) -> None:
         self.server_url = server_url.rstrip("/")
         self.state_dir = state_dir
@@ -598,6 +642,8 @@ class PiEdgeAgent:
         self.upload_batch_max_payloads = max(1, upload_batch_max_payloads)
         self.storage_sample_hz = max(0.0, storage_sample_hz)
         self.storage_sample_interval_seconds = 0.0 if self.storage_sample_hz <= 0 else 1.0 / self.storage_sample_hz
+        self.local_status_host = local_status_host.strip() or LOCAL_STATUS_HOST
+        self.local_status_port = max(0, local_status_port)
         self.data_info_by_metric_id: dict[int, dict[str, Any]] = {}
         self.setting_by_id: dict[int, dict[str, Any]] = {}
         self.stop_event = asyncio.Event()
@@ -609,6 +655,10 @@ class PiEdgeAgent:
         self.counters = dict(self.state.get("counters") or {})
         self.current_processor_identity = dict(self.state.get("current_processor_identity") or {})
         self.processor_reconnect_requested = False
+        self.config_status = "starting"
+        self.processor_connection_status = "starting"
+        self.upstream_connection_status = "starting"
+        self.latest_values_by_metric: dict[str, dict[str, Any]] = {}
         self.live_payload_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=100)
         self._storage_sample_bucket: int | None = None
         self._storage_sample_payload: dict[str, Any] | None = None
@@ -740,6 +790,7 @@ class PiEdgeAgent:
         self.state["config"] = response
         self.state["last_config_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         self.current_config = response
+        self.config_status = "ok"
         self.handle_remote_command(response.get("command") or {})
         self.save_state()
         return response
@@ -966,6 +1017,353 @@ class PiEdgeAgent:
             except asyncio.QueueEmpty:
                 break
         self._reset_storage_sample()
+
+    def latest_metric_key(self, item: dict[str, Any]) -> str | None:
+        metric_id = int_or_none(item.get("id") or item.get("metric_id"))
+        if metric_id is None:
+            return None
+        instance = int_or_none(item.get("inst") or item.get("instance")) or 0
+        return f"{metric_id}:{instance}"
+
+    def latest_metric_value_text(self, item: dict[str, Any]) -> str:
+        for key in ("valStr", "value_text", "dampedVal", "val", "value", "sysVal"):
+            value = item.get(key)
+            if value is not None:
+                return str(value)
+        return "-"
+
+    def record_latest_values(self, readings: list[dict[str, Any]]) -> None:
+        timestamp = utc_timestamp()
+        for item in readings:
+            key = self.latest_metric_key(item)
+            if key is None:
+                continue
+            metric_name = str(item.get("metric_name") or item.get("sname") or item.get("id") or key).strip()
+            unit = str(item.get("unit") or "").replace("&deg;", "deg").strip()
+            self.latest_values_by_metric[key] = {
+                "key": key,
+                "id": int_or_none(item.get("id") or item.get("metric_id")),
+                "instance": int_or_none(item.get("inst") or item.get("instance")) or 0,
+                "metric_name": metric_name,
+                "value_text": self.latest_metric_value_text(item),
+                "unit": unit,
+                "valid": item.get("valid"),
+                "updated_at": timestamp,
+            }
+        if len(self.latest_values_by_metric) > 200:
+            ordered = sorted(self.latest_values_by_metric.values(), key=lambda item: str(item.get("updated_at") or ""), reverse=True)
+            self.latest_values_by_metric = {str(item["key"]): item for item in ordered[:200] if item.get("key")}
+
+    def subscribed_metric_rows(self) -> list[dict[str, Any]]:
+        try:
+            metrics = self.subscription_metrics()
+        except Exception:
+            metrics = []
+        rows: list[dict[str, Any]] = []
+        for item in metrics:
+            metric_id = int_or_none(item.get("id"))
+            if metric_id is None:
+                continue
+            instance = int_or_none(item.get("inst") or item.get("instance")) or 0
+            key = f"{metric_id}:{instance}"
+            latest = dict(self.latest_values_by_metric.get(key) or {})
+            rows.append(
+                {
+                    "key": key,
+                    "id": metric_id,
+                    "instance": instance,
+                    "name": str(item.get("name") or item.get("metric_name") or metric_id),
+                    "latest": latest or None,
+                }
+            )
+        if not rows:
+            rows = [
+                {
+                    "key": key,
+                    "id": item.get("id"),
+                    "instance": item.get("instance"),
+                    "name": item.get("metric_name") or key,
+                    "latest": item,
+                }
+                for key, item in sorted(self.latest_values_by_metric.items())
+            ]
+        return rows
+
+    def local_status_snapshot(self) -> dict[str, Any]:
+        health = self.health_payload(include_support_bundle=False)
+        subscribed = self.subscribed_metric_rows()
+        return {
+            "generated_at": utc_timestamp(),
+            "agent": health.get("agent") or {},
+            "connectivity": {
+                "config": self.config_status,
+                "processor": self.processor_connection_status,
+                "upstream": self.upstream_connection_status,
+                "last_config_age_seconds": iso_age_seconds((health.get("links") or {}).get("last_config_at")),
+                "last_processor_data_age_seconds": iso_age_seconds((health.get("links") or {}).get("last_processor_data_at")),
+                "last_upload_age_seconds": iso_age_seconds((health.get("links") or {}).get("last_upload_at")),
+                "last_upstream_connected_age_seconds": iso_age_seconds((health.get("links") or {}).get("last_upstream_connected_at")),
+            },
+            "health": health,
+            "subscribed_metrics": subscribed,
+            "subscribed_metric_count": len(subscribed),
+            "latest_value_count": len(self.latest_values_by_metric),
+            "live_queue_size": self.live_payload_queue.qsize(),
+        }
+
+    def local_status_pill_class(self, value: Any) -> str:
+        text = str(value or "").lower()
+        if any(token in text for token in ("error", "failed", "reconnecting", "interrupted", "critical", "rejected")):
+            return "bad"
+        if any(token in text for token in ("disabled", "paused", "waiting", "starting", "warn")):
+            return "warn"
+        if any(token in text for token in ("ok", "connected", "streaming", "active")):
+            return "good"
+        return "neutral"
+
+    def render_local_status_html(self, snapshot: dict[str, Any]) -> str:
+        def esc(value: Any) -> str:
+            return html.escape("-" if value is None else str(value))
+
+        agent = snapshot.get("agent") or {}
+        health = snapshot.get("health") or {}
+        controls = health.get("controls") or {}
+        storage = health.get("storage") or {}
+        spool = storage.get("spool") or {}
+        disk = storage.get("disk_guard") or {}
+        links = health.get("links") or {}
+        network = health.get("network") or {}
+        wifi = network.get("wifi") if isinstance(network.get("wifi"), dict) else {}
+        lock = health.get("locked_processor_identity") or {}
+        connectivity = snapshot.get("connectivity") or {}
+
+        def pill(label: str, value: Any) -> str:
+            css = self.local_status_pill_class(value)
+            return f'<div class="pill {css}"><span>{esc(label)}</span><strong>{esc(value)}</strong></div>'
+
+        metric_rows = []
+        for row in snapshot.get("subscribed_metrics") or []:
+            latest = row.get("latest") or {}
+            age = human_duration(iso_age_seconds(latest.get("updated_at"))) if latest else "-"
+            valid = latest.get("valid")
+            valid_text = "-" if valid is None else "yes" if bool(valid) else "no"
+            value = latest.get("value_text") if latest else "waiting"
+            unit = latest.get("unit") if latest else ""
+            metric_rows.append(
+                "<tr>"
+                f"<td>{esc(row.get('id'))}</td>"
+                f"<td>{esc(row.get('name'))}</td>"
+                f"<td>{esc(value)} {esc(unit)}</td>"
+                f"<td>{esc(valid_text)}</td>"
+                f"<td>{esc(age)}</td>"
+                "</tr>"
+            )
+        metrics_html = "\n".join(metric_rows) or '<tr><td colspan="5">No subscribed metrics received yet.</td></tr>'
+
+        discovered = health.get("last_discovered_processors") or []
+        discovered_items = "\n".join(
+            f"<li>{esc(item.get('name') or 'Processor')} - {esc(item.get('model'))} - {esc(item.get('serial_number'))} @ {esc(item.get('last_host'))}:{esc(item.get('port'))}</li>"
+            for item in discovered
+            if isinstance(item, dict)
+        ) or "<li>No recent discovery results.</li>"
+
+        return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="refresh" content="5">
+  <title>Matador Pi Edge Health</title>
+  <style>
+    :root {{
+      color-scheme: dark;
+      --bg: #071018;
+      --panel: #101a26;
+      --panel-2: #162332;
+      --border: #2d4054;
+      --text: #eef6ff;
+      --muted: #9db1c5;
+      --good: #4ade80;
+      --warn: #fbbf24;
+      --bad: #fb7185;
+      --accent: #38bdf8;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{ margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: radial-gradient(circle at top left, #143044, var(--bg) 42rem); color: var(--text); }}
+    main {{ width: min(1180px, calc(100% - 28px)); margin: 22px auto 34px; }}
+    header {{ display: flex; gap: 16px; justify-content: space-between; align-items: flex-start; margin-bottom: 18px; }}
+    h1 {{ margin: 0; font-size: clamp(1.6rem, 3vw, 2.3rem); letter-spacing: -0.03em; }}
+    h2 {{ margin: 0 0 12px; font-size: 0.9rem; text-transform: uppercase; letter-spacing: 0.12em; color: var(--muted); }}
+    .sub {{ color: var(--muted); margin-top: 5px; }}
+    .grid {{ display: grid; grid-template-columns: repeat(12, 1fr); gap: 14px; }}
+    .card {{ grid-column: span 4; background: linear-gradient(180deg, rgba(22,35,50,.94), rgba(10,18,28,.94)); border: 1px solid var(--border); border-radius: 18px; padding: 16px; box-shadow: 0 18px 50px rgba(0,0,0,.25); }}
+    .card.wide {{ grid-column: span 8; }}
+    .card.full {{ grid-column: 1 / -1; }}
+    .pillgrid {{ display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }}
+    .pill {{ border: 1px solid var(--border); border-radius: 14px; padding: 11px 12px; background: rgba(255,255,255,.03); }}
+    .pill span {{ display: block; color: var(--muted); font-size: .72rem; text-transform: uppercase; letter-spacing: .1em; }}
+    .pill strong {{ display: block; margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+    .good {{ border-color: rgba(74,222,128,.55); }}
+    .good strong {{ color: var(--good); }}
+    .warn {{ border-color: rgba(251,191,36,.6); }}
+    .warn strong {{ color: var(--warn); }}
+    .bad {{ border-color: rgba(251,113,133,.7); }}
+    .bad strong {{ color: var(--bad); }}
+    .kv {{ display: grid; grid-template-columns: 11rem 1fr; gap: 8px 12px; font-size: .95rem; }}
+    .kv div:nth-child(odd) {{ color: var(--muted); }}
+    table {{ width: 100%; border-collapse: collapse; overflow: hidden; border-radius: 12px; }}
+    th, td {{ text-align: left; padding: 9px 10px; border-bottom: 1px solid rgba(157,177,197,.18); }}
+    th {{ color: var(--muted); font-size: .74rem; text-transform: uppercase; letter-spacing: .09em; }}
+    tr:last-child td {{ border-bottom: 0; }}
+    ul {{ margin: 0; padding-left: 1.1rem; color: var(--muted); }}
+    code {{ color: var(--accent); }}
+    @media (max-width: 880px) {{ .card, .card.wide {{ grid-column: 1 / -1; }} .pillgrid {{ grid-template-columns: 1fr; }} header {{ flex-direction: column; }} }}
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <div>
+      <h1>{esc(agent.get("hostname") or hostname())}</h1>
+      <div class="sub">{esc(APP_NAME)} {esc(agent.get("version") or APP_VERSION)} / refreshed {esc(snapshot.get("generated_at"))}</div>
+    </div>
+    <div class="sub">JSON: <code>/api/status</code> / Health: <code>/health</code></div>
+  </header>
+  <section class="grid">
+    <div class="card full">
+      <h2>Connectivity</h2>
+      <div class="pillgrid">
+        {pill("Matador config", connectivity.get("config"))}
+        {pill("GoFree processor", connectivity.get("processor"))}
+        {pill("Matador stream", connectivity.get("upstream"))}
+      </div>
+    </div>
+    <div class="card">
+      <h2>Current Links</h2>
+      <div class="kv">
+        <div>Last config</div><div>{esc(links.get("last_config_at"))} ({esc(human_duration(connectivity.get("last_config_age_seconds")))} ago)</div>
+        <div>Last GoFree data</div><div>{esc(links.get("last_processor_data_at"))} ({esc(human_duration(connectivity.get("last_processor_data_age_seconds")))} ago)</div>
+        <div>Last upload</div><div>{esc(links.get("last_upload_at"))} ({esc(human_duration(connectivity.get("last_upload_age_seconds")))} ago)</div>
+        <div>Last upstream</div><div>{esc(links.get("last_upstream_connected_at"))} ({esc(human_duration(connectivity.get("last_upstream_connected_age_seconds")))} ago)</div>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Message Queue</h2>
+      <div class="kv">
+        <div>Pending payloads</div><div>{esc(spool.get("pending_payloads"))}</div>
+        <div>Queued bytes</div><div>{esc(spool.get("queued_payload_bytes"))}</div>
+        <div>Live queue</div><div>{esc(snapshot.get("live_queue_size"))}</div>
+        <div>Oldest pending</div><div>{esc(human_duration(spool.get("oldest_pending_message_age_seconds")))}</div>
+        <div>Drain ETA</div><div>{esc(human_duration(spool.get("estimated_drain_eta_seconds")))}</div>
+        <div>Disk guard</div><div>{esc(disk.get("status"))} - {esc(disk.get("message"))}</div>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Pi Network</h2>
+      <div class="kv">
+        <div>IP addresses</div><div>{esc(", ".join(network.get("ip_addresses") or []))}</div>
+        <div>Default route</div><div>{esc((network.get("default_route") or {}).get("raw"))}</div>
+        <div>wlan0 SSID</div><div>{esc(wifi.get("ssid") or "-")}</div>
+        <div>DNS</div><div>{esc(", ".join(network.get("dns_servers") or []))}</div>
+      </div>
+    </div>
+    <div class="card wide">
+      <h2>Processor Lock</h2>
+      <div class="kv">
+        <div>Name</div><div>{esc(lock.get("name"))}</div>
+        <div>Model</div><div>{esc(lock.get("model"))}</div>
+        <div>Serial</div><div>{esc(lock.get("serial_number"))}</div>
+        <div>Host</div><div>{esc(lock.get("last_host"))}:{esc(lock.get("port"))}</div>
+        <div>Confidence</div><div>{esc(health.get("lock_confidence"))}</div>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Controls</h2>
+      <div class="kv">
+        <div>Processor</div><div>{esc(controls.get("processor_enabled"))}</div>
+        <div>Streaming</div><div>{esc(controls.get("streaming_enabled"))}</div>
+        <div>Uploads paused</div><div>{esc(controls.get("upload_paused"))}</div>
+        <div>Storage sample</div><div>{esc(controls.get("historical_storage_sample_hz"))} Hz</div>
+      </div>
+    </div>
+    <div class="card full">
+      <h2>Subscribed Data ({esc(snapshot.get("subscribed_metric_count"))})</h2>
+      <table>
+        <thead><tr><th>ID</th><th>Metric</th><th>Latest</th><th>Valid</th><th>Age</th></tr></thead>
+        <tbody>{metrics_html}</tbody>
+      </table>
+    </div>
+    <div class="card full">
+      <h2>Discovered GoFree Processors</h2>
+      <ul>{discovered_items}</ul>
+    </div>
+  </section>
+</main>
+</body>
+</html>"""
+
+    async def write_local_status_response(self, writer: asyncio.StreamWriter, status: str, content_type: str, body: str) -> None:
+        encoded = body.encode("utf-8")
+        writer.write(
+            (
+                f"HTTP/1.1 {status}\r\n"
+                f"Content-Type: {content_type}; charset=utf-8\r\n"
+                f"Content-Length: {len(encoded)}\r\n"
+                "Cache-Control: no-store\r\n"
+                "Connection: close\r\n\r\n"
+            ).encode("ascii")
+            + encoded
+        )
+        await writer.drain()
+        writer.close()
+        with suppress(Exception):
+            await writer.wait_closed()
+
+    async def handle_local_status_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            request = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=3.0)
+            request_line = request.decode("iso-8859-1", errors="ignore").splitlines()[0]
+            method, target, _ = (request_line.split(" ", 2) + ["", ""])[:3]
+            path = target.split("?", 1)[0]
+            if method.upper() != "GET":
+                await self.write_local_status_response(writer, "405 Method Not Allowed", "text/plain", "Method not allowed")
+                return
+            snapshot = self.local_status_snapshot()
+            if path in {"/api/status", "/status.json"}:
+                await self.write_local_status_response(writer, "200 OK", "application/json", json.dumps(snapshot, indent=2, sort_keys=True, default=str))
+            elif path == "/health":
+                body = json.dumps({"ok": True, "agent": snapshot.get("agent"), "connectivity": snapshot.get("connectivity")}, indent=2, sort_keys=True)
+                await self.write_local_status_response(writer, "200 OK", "application/json", body)
+            elif path in {"/", "/index.html"}:
+                await self.write_local_status_response(writer, "200 OK", "text/html", self.render_local_status_html(snapshot))
+            else:
+                await self.write_local_status_response(writer, "404 Not Found", "text/plain", "Not found")
+        except Exception as exc:
+            LOGGER.debug("Local status request failed: %s", exc)
+            with suppress(Exception):
+                await self.write_local_status_response(writer, "500 Internal Server Error", "text/plain", "Local status error")
+
+    async def local_status_loop(self) -> None:
+        if self.local_status_port <= 0:
+            LOGGER.info("Pi Edge local status page disabled")
+            return
+        try:
+            server = await asyncio.start_server(
+                self.handle_local_status_client,
+                self.local_status_host,
+                self.local_status_port,
+                reuse_address=True,
+            )
+        except OSError as exc:
+            LOGGER.warning("Unable to start Pi Edge local status page on %s:%s: %s", self.local_status_host, self.local_status_port, exc)
+            return
+        sockets = ", ".join(str(sock.getsockname()) for sock in (server.sockets or []))
+        LOGGER.info("Pi Edge local status page available on http://%s:%s/ (%s)", self.local_status_host, self.local_status_port, sockets)
+        async with server:
+            while not self.stop_event.is_set():
+                await asyncio.sleep(1.0)
+            server.close()
+            await server.wait_closed()
 
     def run_self_test(self) -> dict[str, Any]:
         generated_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -1577,6 +1975,7 @@ class PiEdgeAgent:
             try:
                 await asyncio.to_thread(self.fetch_config)
                 if not self.processor_enabled:
+                    self.processor_connection_status = "disabled"
                     await asyncio.sleep(IDLE_SLEEP_SECONDS)
                     continue
                 processor_host, processor_port, processor_path = self.resolve_processor()
@@ -1589,6 +1988,7 @@ class PiEdgeAgent:
                 raise
             except Exception as exc:
                 await self.flush_historical_payloads()
+                self.processor_connection_status = f"reconnecting: {exc}"
                 LOGGER.warning("Processor loop interrupted: %s. Reconnecting in %.1fs", exc, backoff)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60.0)
@@ -1598,6 +1998,7 @@ class PiEdgeAgent:
         self.setting_by_id.clear()
         url = f"ws://{processor_host}:{processor_port}{processor_path or '/'}"
         LOGGER.info("Connecting to GoFree processor at %s", url)
+        self.processor_connection_status = f"connecting {processor_host}:{processor_port}"
         async with websockets.connect(
             url,
             ping_interval=self.processor_ping_interval_seconds,
@@ -1610,6 +2011,7 @@ class PiEdgeAgent:
             last_data_received = time.monotonic()
             self.state["last_processor_host"] = processor_host
             self.save_state()
+            self.processor_connection_status = f"connected {processor_host}:{processor_port}"
             LOGGER.info("Subscribed to %s GoFree metrics", len(self.subscription_metrics()))
             while not self.stop_event.is_set() and self.processor_enabled:
                 if self.processor_reconnect_requested:
@@ -1652,6 +2054,7 @@ class PiEdgeAgent:
                 }
                 if not outgoing["Data"]:
                     continue
+                self.record_latest_values(outgoing["Data"])
                 self.enqueue_live_payload(outgoing)
                 await self.enqueue_historical_payloads(outgoing)
 
@@ -1661,6 +2064,7 @@ class PiEdgeAgent:
             try:
                 await asyncio.to_thread(self.fetch_config)
                 if not self.streaming_enabled or self.upload_paused:
+                    self.upstream_connection_status = "paused" if self.upload_paused else "disabled"
                     await asyncio.sleep(IDLE_SLEEP_SECONDS)
                     continue
                 await self.stream_once()
@@ -1671,12 +2075,15 @@ class PiEdgeAgent:
             except urllib.error.HTTPError as exc:
                 if exc.code in (401, 403):
                     LOGGER.error("Matador rejected this Pi Edge Agent token; re-enrollment is required")
+                    self.upstream_connection_status = "rejected"
                     self.stop_event.set()
                     return
+                self.upstream_connection_status = f"reconnecting: {exc}"
                 LOGGER.warning("Matador config failed: %s. Reconnecting in %.1fs", exc, backoff)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60.0)
             except Exception as exc:
+                self.upstream_connection_status = f"reconnecting: {exc}"
                 LOGGER.warning("Upstream stream interrupted: %s. Reconnecting in %.1fs", exc, backoff)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60.0)
@@ -1726,8 +2133,10 @@ class PiEdgeAgent:
             raise RuntimeError("No device token available")
         upstream_url = f"{self.server_url.replace('https://', 'wss://').replace('http://', 'ws://')}/edge/stream?token={token}"
         LOGGER.info("Connecting upstream to %s", upstream_url.split("?token=", 1)[0])
+        self.upstream_connection_status = "connecting"
         async with websockets.connect(upstream_url, ping_interval=30, ping_timeout=30) as websocket:
             LOGGER.info("Upstream Matador stream connected")
+            self.upstream_connection_status = "connected"
             self.state["last_upstream_connected_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             while not self.stop_event.is_set() and self.streaming_enabled:
                 if self.upload_paused:
@@ -1769,7 +2178,7 @@ class PiEdgeAgent:
     async def run(self) -> None:
         await asyncio.to_thread(self.ensure_unique_hostname_for_golden_image)
         await asyncio.to_thread(self.fetch_config)
-        await asyncio.gather(self.config_loop(), self.processor_loop(), self.stream_loop())
+        await asyncio.gather(self.config_loop(), self.processor_loop(), self.stream_loop(), self.local_status_loop())
 
     async def config_loop(self) -> None:
         while not self.stop_event.is_set():
@@ -1781,10 +2190,13 @@ class PiEdgeAgent:
             except urllib.error.HTTPError as exc:
                 if exc.code in (401, 403):
                     LOGGER.error("Matador rejected this Pi Edge Agent token; re-enrollment is required")
+                    self.config_status = "rejected"
                     self.stop_event.set()
                     return
+                self.config_status = f"error: {exc}"
                 LOGGER.warning("Config poll failed: %s", exc)
             except Exception as exc:
+                self.config_status = f"error: {exc}"
                 LOGGER.warning("Config poll failed: %s", exc)
             await asyncio.sleep(CONFIG_POLL_SECONDS)
 
@@ -1840,6 +2252,17 @@ def parse_args() -> argparse.Namespace:
         default=float(os.environ.get("MATADOR_PI_EDGE_STORAGE_SAMPLE_HZ", str(STORAGE_SAMPLE_HZ))),
         help="Durable queue sampling rate for historical/export data. Default 1 Hz; set 0 to queue every GoFree payload.",
     )
+    parser.add_argument(
+        "--local-status-host",
+        default=os.environ.get("MATADOR_PI_EDGE_LOCAL_STATUS_HOST", LOCAL_STATUS_HOST),
+        help="Bind address for the local Pi health web page. Default 0.0.0.0 for LAN access.",
+    )
+    parser.add_argument(
+        "--local-status-port",
+        type=int,
+        default=int(os.environ.get("MATADOR_PI_EDGE_LOCAL_STATUS_PORT", str(LOCAL_STATUS_PORT))),
+        help="Port for the local Pi health web page. Default 8080; set 0 to disable.",
+    )
     parser.add_argument("--discover-once", action="store_true", help="Print discovered GoFree processors and exit")
     parser.add_argument("--log-level", default=os.environ.get("MATADOR_PI_EDGE_LOG_LEVEL", "INFO"), help="Python logging level")
     return parser.parse_args()
@@ -1872,6 +2295,8 @@ def main() -> None:
         upload_batch_max_readings=args.upload_batch_max_readings,
         upload_batch_max_payloads=args.upload_batch_max_payloads,
         storage_sample_hz=args.storage_sample_hz,
+        local_status_host=args.local_status_host,
+        local_status_port=args.local_status_port,
     )
     try:
         asyncio.run(agent.run())
