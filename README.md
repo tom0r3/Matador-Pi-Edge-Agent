@@ -1,6 +1,10 @@
 # Matador
 
-Current release: `Version 3.5.9`
+Current release: `Version 3.6.0`
+
+`Version 3.6.0` checks the public network organisation every five minutes and
+reports a confirmed Starlink connection to Matador without collecting or
+sending the Pi's public IP address.
 
 `Version 3.5.9` preserves the true or magnetic reference supplied by GoFree
 for TWD, heading, and start-line bearing telemetry. It accepts both list and

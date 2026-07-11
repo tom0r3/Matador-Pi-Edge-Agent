@@ -28,7 +28,7 @@ import websockets
 
 
 APP_NAME = "Matador Pi Edge Agent"
-DEFAULT_APP_VERSION = "3.5.9"
+DEFAULT_APP_VERSION = "3.6.0"
 DEFAULT_SERVER = "https://matador.torodatasystems.eu"
 GOFREE_DISCOVERY_GROUP = "239.2.1.1"
 GOFREE_DISCOVERY_PORTS = (2052, 2050)
@@ -49,6 +49,8 @@ DISK_STOP_BUFFERING_USED_PERCENT = 95.0
 CONFIG_POLL_SECONDS = 10.0
 CLAIM_POLL_SECONDS = 15.0
 IDLE_SLEEP_SECONDS = 1.0
+NETWORK_PATH_PROBE_SECONDS = 300.0
+NETWORK_PATH_PROBE_URL = "https://ipinfo.io/org"
 GOFREE_COMPASS_TRUE_MAG_SETTING_ID = 21
 GOFREE_BARCODE_SERIAL_SETTING_ID = 89
 GOFREE_SETTING_IDS = (GOFREE_COMPASS_TRUE_MAG_SETTING_ID, GOFREE_BARCODE_SERIAL_SETTING_ID)
@@ -507,6 +509,31 @@ def network_snapshot() -> dict[str, Any]:
     return snapshot
 
 
+def detect_public_network_path() -> dict[str, Any]:
+    """Classify the public egress provider without collecting a public IP."""
+    checked_at = utc_timestamp()
+    try:
+        request = urllib.request.Request(NETWORK_PATH_PROBE_URL, headers={"Accept": "text/plain"})
+        with urllib.request.urlopen(request, timeout=5) as response:
+            provider = response.read().decode("utf-8", errors="replace").strip()
+    except Exception as exc:
+        return {
+            "type": "unknown",
+            "provider": None,
+            "checked_at": checked_at,
+            "source": "ipinfo_org",
+            "error": str(exc)[:240],
+        }
+    is_starlink = "as14593" in provider.lower() or "space exploration technologies" in provider.lower()
+    return {
+        "type": "starlink" if is_starlink else "unknown",
+        "provider": provider or None,
+        "checked_at": checked_at,
+        "source": "ipinfo_org",
+        "error": None,
+    }
+
+
 def bearer_headers(token: str | None = None) -> dict[str, str]:
     headers = {"Accept": "application/json", "Content-Type": "application/json"}
     if token:
@@ -677,6 +704,13 @@ class PiEdgeAgent:
         self.config_status = "starting"
         self.processor_connection_status = "starting"
         self.upstream_connection_status = "starting"
+        self.network_path: dict[str, Any] = {
+            "type": "unknown",
+            "provider": None,
+            "checked_at": None,
+            "source": "ipinfo_org",
+            "error": None,
+        }
         self.latest_values_by_metric: dict[str, dict[str, Any]] = {}
         self.live_payload_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=100)
         self._storage_sample_bucket: int | None = None
@@ -1757,7 +1791,7 @@ class PiEdgeAgent:
                 "disk_guard": self.disk_guard(state_stats, spool_stats),
             },
             "system": load_average(),
-            "network": network_snapshot(),
+            "network": {**network_snapshot(), "egress": dict(self.network_path)},
             "update_timer": self.update_timer_state(),
             "update_result": self.update_result(),
             "counters": self.counters,
@@ -2209,7 +2243,18 @@ class PiEdgeAgent:
     async def run(self) -> None:
         await asyncio.to_thread(self.ensure_unique_hostname_for_golden_image)
         await asyncio.to_thread(self.fetch_config)
-        await asyncio.gather(self.config_loop(), self.processor_loop(), self.stream_loop(), self.local_status_loop())
+        await asyncio.gather(
+            self.config_loop(),
+            self.processor_loop(),
+            self.stream_loop(),
+            self.local_status_loop(),
+            self.network_path_loop(),
+        )
+
+    async def network_path_loop(self) -> None:
+        while not self.stop_event.is_set():
+            self.network_path = await asyncio.to_thread(detect_public_network_path)
+            await asyncio.sleep(NETWORK_PATH_PROBE_SECONDS)
 
     async def config_loop(self) -> None:
         while not self.stop_event.is_set():

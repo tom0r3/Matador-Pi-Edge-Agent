@@ -1,10 +1,19 @@
 # Matador Pi Edge Agent
 
 The Matador Pi Edge Agent is the headless Raspberry Pi companion to the
-Windows Matador Edge Agent. Version 3.5.8 is the current production baseline:
+Windows Matador Edge Agent. Version 3.6.0 is the current production baseline:
 unattended operation, discovery, durable offline spooling, remote commands,
 health/storage telemetry, no-code admin claiming, golden-image preparation,
 and remote diagnostics/maintenance from Matador Admin.
+
+## Public Network Classification
+
+Every five minutes the agent asks `https://ipinfo.io/org` for the public
+network organisation. If it identifies AS14593 / Space Exploration
+Technologies, it reports `starlink` in its health payload. Matador uses this to
+show the Starlink status mark beside an active Pi Edge processor. The request
+does not collect or report the public IP address. Any other provider, or a
+failed lookup, is reported as `unknown` and shows no status mark.
 
 ## Three-Stage Appliance Roadmap
 
@@ -16,7 +25,7 @@ and remote diagnostics/maintenance from Matador Admin.
   server-visible health payloads, remote start/stop/connect commands, and
   no-code admin claiming for pre-imaged appliances.
 
-## Version 3.5.8 Capabilities
+## Version 3.6.0 Capabilities
 
 - Runs unattended as a Python module under `systemd`.
 - Discovers B&G GoFree processors from UDP multicast `239.2.1.1` on ports

@@ -5,17 +5,23 @@ All notable project changes will be recorded here.
 ## Unreleased
 
 - Added a lightweight local Pi Edge health web page on port `8080` with
-  connectivity, queue, Pi health, processor lock, discovery, and subscribed
-  metric status, plus JSON endpoints at `/api/status` and `/health`.
+-  connectivity, queue, Pi health, processor lock, discovery, and subscribed
+-  metric status, plus JSON endpoints at `/api/status` and `/health`.
 - Hardened the local Pi Edge health page so transient snapshot/render failures
-  show as page warnings and normal service logs instead of returning a generic
-  `Local status error`.
+-  show as page warnings and normal service logs instead of returning a generic
+-  `Local status error`.
 - Changed the local Pi Edge health page request handler to ignore normal browser
-  disconnects, log full tracebacks for genuine page errors, and render an
-  explanatory local error page if an internal status-page failure still occurs.
+-  disconnects, log full tracebacks for genuine page errors, and render an
+-  explanatory local error page if an internal status-page failure still occurs.
 - Fixed browser speculative/preload sockets timing out before sending a request
-  so they are closed quietly instead of being rendered as a visible
-  `TimeoutError` page.
+-  so they are closed quietly instead of being rendered as a visible
+-  `TimeoutError` page.
+
+## 2026-07-11 - Version 3.6.0
+
+- Added five-minute public egress classification for Starlink. The Pi reports
+  only the network organisation and classification to Matador; it never sends a
+  public IP address. Matador can show the Starlink status mark when confirmed.
 
 ## 2026-07-10 - Version 3.5.9
 
