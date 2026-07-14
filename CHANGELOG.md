@@ -4,6 +4,17 @@ All notable project changes will be recorded here.
 
 ## Unreleased
 
+## 2026-07-13 - Version 3.6.2
+
+- Moved Pi Edge GoFree setting subscriptions to the server-provided
+  `gofree_setting_ids` configuration field, with a safe fallback for older
+  Matador servers.
+- Request mast height above waterline setting `31` alongside the existing
+  true/magnetic reference and barcode settings when the server does not provide
+  an explicit list.
+- Reconnect the local GoFree websocket after a Matador configuration refresh
+  changes the requested setting IDs, port, path, or metric list.
+
 - Added a lightweight local Pi Edge health web page on port `8080` with
 -  connectivity, queue, Pi health, processor lock, discovery, and subscribed
 -  metric status, plus JSON endpoints at `/api/status` and `/health`.

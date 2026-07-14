@@ -1,6 +1,13 @@
 # Matador
 
-Current release: `Version 3.6.0`
+Current release: `Version 3.6.2`
+
+`Version 3.6.2` receives its read-only GoFree setting subscriptions from the
+Matador server. The server controls the requested setting IDs through
+`EDGE_GOFREE_SETTING_IDS`; a configuration change reconnects the local GoFree
+websocket automatically. Future approved setting subscriptions therefore do not
+require a Pi Agent rebuild. The compatibility fallback requests settings `21`,
+`31`, and `89` when connected to an older server.
 
 `Version 3.6.0` checks the public network organisation every five minutes and
 reports a confirmed Starlink connection to Matador without collecting or

@@ -28,7 +28,7 @@ import websockets
 
 
 APP_NAME = "Matador Pi Edge Agent"
-DEFAULT_APP_VERSION = "3.6.0"
+DEFAULT_APP_VERSION = "3.6.2"
 DEFAULT_SERVER = "https://matador.torodatasystems.eu"
 GOFREE_DISCOVERY_GROUP = "239.2.1.1"
 GOFREE_DISCOVERY_PORTS = (2052, 2050)
@@ -52,8 +52,14 @@ IDLE_SLEEP_SECONDS = 1.0
 NETWORK_PATH_PROBE_SECONDS = 300.0
 NETWORK_PATH_PROBE_URL = "https://ipinfo.io/org"
 GOFREE_COMPASS_TRUE_MAG_SETTING_ID = 21
+GOFREE_MAST_HEIGHT_ABOVE_WL_SETTING_ID = 31
 GOFREE_BARCODE_SERIAL_SETTING_ID = 89
-GOFREE_SETTING_IDS = (GOFREE_COMPASS_TRUE_MAG_SETTING_ID, GOFREE_BARCODE_SERIAL_SETTING_ID)
+GOFREE_SETTING_IDS = (
+    GOFREE_COMPASS_TRUE_MAG_SETTING_ID,
+    GOFREE_MAST_HEIGHT_ABOVE_WL_SETTING_ID,
+    GOFREE_BARCODE_SERIAL_SETTING_ID,
+)
+MAX_GOFREE_SETTING_IDS = 32
 GOFREE_DATA_INFO_METRIC_NAMES = {
     "COG",
     "HEADING",
@@ -828,6 +834,7 @@ class PiEdgeAgent:
 
     def fetch_config(self) -> dict[str, Any]:
         self.enroll_if_needed()
+        previous_signature = self.subscription_signature(self.current_config)
         try:
             response = self.request_config()
         except urllib.error.HTTPError as exc:
@@ -843,6 +850,9 @@ class PiEdgeAgent:
         self.state["config"] = response
         self.state["last_config_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         self.current_config = response
+        if previous_signature and previous_signature != self.subscription_signature(response):
+            self.processor_reconnect_requested = True
+            LOGGER.info("GoFree subscription configuration changed; reconnecting processor websocket")
         self.config_status = "ok"
         self.handle_remote_command(response.get("command") or {})
         self.save_state()
@@ -1948,7 +1958,50 @@ class PiEdgeAgent:
         return json.dumps({"DataInfoReq": metric_ids}, separators=(",", ":")) if metric_ids else None
 
     def setting_message(self) -> str:
-        return json.dumps({"SettingReq": {"ids": list(GOFREE_SETTING_IDS)}}, separators=(",", ":"))
+        return json.dumps({"SettingReq": {"ids": self.configured_gofree_setting_ids()}}, separators=(",", ":"))
+
+    def configured_gofree_setting_ids(self) -> list[int]:
+        """Use the server configuration while retaining old-server compatibility."""
+        raw_ids = self.current_config.get("gofree_setting_ids")
+        if not isinstance(raw_ids, list):
+            return list(GOFREE_SETTING_IDS)
+        setting_ids: list[int] = []
+        for raw_id in raw_ids:
+            setting_id = int_or_none(raw_id)
+            if setting_id is None or not 1 <= setting_id <= 10000 or setting_id in setting_ids:
+                continue
+            setting_ids.append(setting_id)
+            if len(setting_ids) == MAX_GOFREE_SETTING_IDS:
+                break
+        return setting_ids or list(GOFREE_SETTING_IDS)
+
+    def subscription_signature(self, config: dict[str, Any]) -> str:
+        local = config.get("local_processor") or {}
+        metric_ids = sorted(
+            metric_id
+            for item in (config.get("metrics") or [])
+            if isinstance(item, dict)
+            for metric_id in [int_or_none(item.get("id"))]
+            if metric_id is not None
+        )
+        raw_setting_ids = config.get("gofree_setting_ids")
+        setting_ids: list[int] = []
+        for raw_setting_id in (raw_setting_ids if isinstance(raw_setting_ids, list) else GOFREE_SETTING_IDS):
+            setting_id = int_or_none(raw_setting_id)
+            if setting_id is None or not 1 <= setting_id <= 10000 or setting_id in setting_ids:
+                continue
+            setting_ids.append(setting_id)
+            if len(setting_ids) == MAX_GOFREE_SETTING_IDS:
+                break
+        return json.dumps(
+            {
+                "port": int_or_none(local.get("port")) or 2053,
+                "path": local.get("path") or "/",
+                "metrics": metric_ids,
+                "settings": sorted(set(setting_ids)),
+            },
+            separators=(",", ":"),
+        )
 
     async def request_metadata(self, websocket) -> None:
         data_info_message = self.data_info_message()
