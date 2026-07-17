@@ -44,7 +44,11 @@ step() {
 
 step "Python compile"
 "$PYTHON_BIN" -m py_compile \
-  edge_agent/pi_edge_agent.py
+  edge_agent/pi_edge_agent.py \
+  edge_agent/navico_advertiser.py
+
+step "Python tests"
+"$PYTHON_BIN" -m unittest discover -s tests
 
 step "Browser JavaScript parse"
 printf 'No browser JavaScript in the standalone Pi Agent repository.\n'
@@ -66,14 +70,17 @@ done
 
 if command -v git >/dev/null 2>&1; then
   step "Git whitespace check"
-  git diff --check -- \
+  git -c "safe.directory=$ROOT_DIR" -C "$ROOT_DIR" diff --check -- \
     edge_agent/pi_edge_agent.py \
+    edge_agent/navico_advertiser.py \
+    tests/test_navico_advertiser.py \
     README.md \
     CHANGELOG.md \
     VERSION \
     scripts/update.sh \
     scripts/install.sh \
     scripts/status.sh \
+    deploy/matador-pi-edge-agent.service \
     scripts/dev-check.ps1 \
     scripts/dev-check.sh
 else

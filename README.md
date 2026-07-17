@@ -58,3 +58,11 @@ connections that send no request are ignored, and any genuine local-page
 rendering error is logged with a traceback in
 `journalctl -u matador-pi-edge-agent.service`.
 
+Pi appliances now also advertise a Navico HTML5 app tile for compatible B&G,
+Simrad, and Lowrance MFDs. By default the Pi sends the proven descriptor to
+`239.2.1.1:2053` from `eth0` every 10 seconds, serves the compact TORO favicon
+locally at `http://<pi-mfd-address>/icon.png?v=toro-favicon-1`, and opens
+`https://matador.torodatasystems.eu/` directly when the `Matador` tile is
+selected. The production profile deliberately does not send TORO UDP `2052`,
+mDNS, or `navico-nav-ws` announcements.
+

@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import urllib.request
 from pathlib import Path
 
 state_dir = Path(os.environ.get("MATADOR_PI_EDGE_STATE_DIR", "/var/lib/matador-pi-edge-agent"))
@@ -76,4 +77,21 @@ if spool_path.exists():
         print(f"Message queue pending: unable to read spool database: {exc}")
 else:
     print("Message queue pending: spool database not created yet")
+
+local_status_port = int(os.environ.get("MATADOR_PI_EDGE_LOCAL_STATUS_PORT", "8080") or "0")
+if local_status_port > 0:
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{local_status_port}/api/status", timeout=2) as response:
+            live_status = json.loads(response.read().decode("utf-8"))
+        navico = ((live_status.get("health") or {}).get("navico_html5_advertiser") or {})
+        if navico:
+            print(f"Navico advertiser enabled: {navico.get('enabled')}")
+            print(f"Navico advertiser running: {navico.get('running')}")
+            print(f"Navico MFD interface: {navico.get('interface') or '-'}")
+            print(f"Navico MFD address: {navico.get('selected_address') or '-'}")
+            print(f"Navico last send: {navico.get('last_send_at') or '-'}")
+            print(f"Navico send/errors: {navico.get('send_count') or 0}/{navico.get('error_count') or 0}")
+            print(f"Navico last error: {navico.get('last_error') or '-'}")
+    except Exception as exc:
+        print(f"Navico advertiser live status: unavailable from local status page ({exc})")
 PY

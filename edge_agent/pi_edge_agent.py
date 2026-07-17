@@ -26,6 +26,16 @@ from typing import Any
 
 import websockets
 
+from edge_agent.navico_advertiser import (
+    DEFAULT_ICON_HTTP_PORT,
+    DEFAULT_ICON_PATH,
+    DEFAULT_ICON_REVISION,
+    DEFAULT_INTERVAL_MS,
+    NavicoAdvertiserSettings,
+    NavicoHtml5Advertiser,
+    parse_bool as parse_navico_bool,
+)
+
 
 APP_NAME = "Matador Pi Edge Agent"
 DEFAULT_APP_VERSION = "3.6.2"
@@ -678,6 +688,7 @@ class PiEdgeAgent:
         storage_sample_hz: float,
         local_status_host: str,
         local_status_port: int,
+        navico_advertiser_settings: NavicoAdvertiserSettings,
     ) -> None:
         self.server_url = server_url.rstrip("/")
         self.state_dir = state_dir
@@ -696,6 +707,7 @@ class PiEdgeAgent:
         self.storage_sample_interval_seconds = 0.0 if self.storage_sample_hz <= 0 else 1.0 / self.storage_sample_hz
         self.local_status_host = local_status_host.strip() or LOCAL_STATUS_HOST
         self.local_status_port = max(0, local_status_port)
+        self.navico_advertiser = NavicoHtml5Advertiser(navico_advertiser_settings)
         self.data_info_by_metric_id: dict[int, dict[str, Any]] = {}
         self.setting_by_id: dict[int, dict[str, Any]] = {}
         self.stop_event = asyncio.Event()
@@ -1153,8 +1165,44 @@ class PiEdgeAgent:
         return rows
 
     def local_status_snapshot(self) -> dict[str, Any]:
-        health = self.health_payload(include_support_bundle=False)
-        subscribed = self.subscribed_metric_rows()
+        errors: list[str] = []
+        try:
+            health = self.health_payload(include_support_bundle=False)
+        except Exception as exc:
+            LOGGER.warning("Local status health snapshot failed: %s", exc)
+            errors.append(f"health snapshot: {exc}")
+            health = {
+                "agent": {"kind": "pi_edge_agent", "name": APP_NAME, "version": APP_VERSION, "hostname": hostname()},
+                "controls": {
+                    "processor_enabled": self.processor_enabled,
+                    "streaming_enabled": self.streaming_enabled,
+                    "upload_paused": self.upload_paused,
+                    "historical_storage_sample_hz": self.storage_sample_hz,
+                },
+                "storage": {
+                    "state_dir": disk_stats(self.state_dir),
+                    "spool": {},
+                    "disk_guard": {"status": "unknown", "message": "Health snapshot failed"},
+                },
+                "network": {"hostname": hostname()},
+                "links": {
+                    "last_config_at": self.state.get("last_config_at") or None,
+                    "last_processor_data_at": self.state.get("last_processor_data_at") or None,
+                    "last_upstream_connected_at": self.state.get("last_upstream_connected_at") or None,
+                    "last_upload_at": self.state.get("last_upload_at") or None,
+                },
+                "counters": self.counters,
+                "last_discovered_processors": self.state.get("last_discovered_processors") or [],
+                "locked_processor_identity": self.locked_processor_identity(),
+                "lock_confidence": "unknown",
+                "navico_html5_advertiser": self.navico_advertiser.status(),
+            }
+        try:
+            subscribed = self.subscribed_metric_rows()
+        except Exception as exc:
+            LOGGER.warning("Local status subscribed metrics snapshot failed: %s", exc)
+            errors.append(f"subscribed metrics: {exc}")
+            subscribed = []
         return {
             "generated_at": utc_timestamp(),
             "agent": health.get("agent") or {},
@@ -1172,6 +1220,7 @@ class PiEdgeAgent:
             "subscribed_metric_count": len(subscribed),
             "latest_value_count": len(self.latest_values_by_metric),
             "live_queue_size": self.live_payload_queue.qsize(),
+            "errors": errors,
         }
 
     def local_status_pill_class(self, value: Any) -> str:
@@ -1188,25 +1237,37 @@ class PiEdgeAgent:
         def esc(value: Any) -> str:
             return html.escape("-" if value is None else str(value))
 
-        agent = snapshot.get("agent") or {}
-        health = snapshot.get("health") or {}
-        controls = health.get("controls") or {}
-        storage = health.get("storage") or {}
-        spool = storage.get("spool") or {}
-        disk = storage.get("disk_guard") or {}
-        links = health.get("links") or {}
-        network = health.get("network") or {}
-        wifi = network.get("wifi") if isinstance(network.get("wifi"), dict) else {}
-        lock = health.get("locked_processor_identity") or {}
-        connectivity = snapshot.get("connectivity") or {}
+        def as_dict(value: Any) -> dict[str, Any]:
+            return value if isinstance(value, dict) else {}
+
+        def as_list(value: Any) -> list[Any]:
+            return value if isinstance(value, list) else []
+
+        def join_values(value: Any) -> str:
+            return ", ".join(str(item) for item in as_list(value))
+
+        agent = as_dict(snapshot.get("agent"))
+        health = as_dict(snapshot.get("health"))
+        controls = as_dict(health.get("controls"))
+        storage = as_dict(health.get("storage"))
+        spool = as_dict(storage.get("spool"))
+        disk = as_dict(storage.get("disk_guard"))
+        links = as_dict(health.get("links"))
+        network = as_dict(health.get("network"))
+        wifi = as_dict(network.get("wifi"))
+        default_route = as_dict(network.get("default_route"))
+        lock = as_dict(health.get("locked_processor_identity"))
+        navico = as_dict(health.get("navico_html5_advertiser"))
+        connectivity = as_dict(snapshot.get("connectivity"))
 
         def pill(label: str, value: Any) -> str:
             css = self.local_status_pill_class(value)
             return f'<div class="pill {css}"><span>{esc(label)}</span><strong>{esc(value)}</strong></div>'
 
         metric_rows = []
-        for row in snapshot.get("subscribed_metrics") or []:
-            latest = row.get("latest") or {}
+        for item in as_list(snapshot.get("subscribed_metrics")):
+            row = as_dict(item)
+            latest = as_dict(row.get("latest"))
             age = human_duration(iso_age_seconds(latest.get("updated_at"))) if latest else "-"
             valid = latest.get("valid")
             valid_text = "-" if valid is None else "yes" if bool(valid) else "no"
@@ -1223,12 +1284,21 @@ class PiEdgeAgent:
             )
         metrics_html = "\n".join(metric_rows) or '<tr><td colspan="5">No subscribed metrics received yet.</td></tr>'
 
-        discovered = health.get("last_discovered_processors") or []
+        discovered = as_list(health.get("last_discovered_processors"))
         discovered_items = "\n".join(
             f"<li>{esc(item.get('name') or 'Processor')} - {esc(item.get('model'))} - {esc(item.get('serial_number'))} @ {esc(item.get('last_host'))}:{esc(item.get('port'))}</li>"
             for item in discovered
             if isinstance(item, dict)
         ) or "<li>No recent discovery results.</li>"
+        errors = as_list(snapshot.get("errors"))
+        errors_html = ""
+        if errors:
+            error_items = "".join(f"<li>{esc(error)}</li>" for error in errors)
+            errors_html = f"""
+    <div class="card full">
+      <h2>Status Page Warnings</h2>
+      <ul>{error_items}</ul>
+    </div>"""
 
         return f"""<!doctype html>
 <html lang="en">
@@ -1324,10 +1394,10 @@ class PiEdgeAgent:
     <div class="card">
       <h2>Pi Network</h2>
       <div class="kv">
-        <div>IP addresses</div><div>{esc(", ".join(network.get("ip_addresses") or []))}</div>
-        <div>Default route</div><div>{esc((network.get("default_route") or {}).get("raw"))}</div>
+        <div>IP addresses</div><div>{esc(join_values(network.get("ip_addresses")))}</div>
+        <div>Default route</div><div>{esc(default_route.get("raw"))}</div>
         <div>wlan0 SSID</div><div>{esc(wifi.get("ssid") or "-")}</div>
-        <div>DNS</div><div>{esc(", ".join(network.get("dns_servers") or []))}</div>
+        <div>DNS</div><div>{esc(join_values(network.get("dns_servers")))}</div>
       </div>
     </div>
     <div class="card wide">
@@ -1350,6 +1420,22 @@ class PiEdgeAgent:
       </div>
     </div>
     <div class="card full">
+      <h2>Navico HTML5 Advertisement</h2>
+      <div class="pillgrid">
+        {pill("Advertiser", "active" if navico.get("running") else "disabled" if not navico.get("enabled") else "waiting")}
+        {pill("MFD interface", navico.get("interface"))}
+        {pill("MFD address", navico.get("selected_address") or "waiting")}
+      </div>
+      <div class="kv" style="margin-top: 12px;">
+        <div>Tile</div><div>{esc(navico.get("app_name"))} via {esc(navico.get("multicast_group"))}:{esc(navico.get("multicast_port"))}</div>
+        <div>Matador URL</div><div>{esc(navico.get("app_url"))}</div>
+        <div>Icon URL</div><div>{esc(navico.get("icon_url"))}</div>
+        <div>Last send</div><div>{esc(navico.get("last_send_at"))}</div>
+        <div>Send count</div><div>{esc(navico.get("send_count"))}</div>
+        <div>Last error</div><div>{esc(navico.get("last_error"))}</div>
+      </div>
+    </div>
+    <div class="card full">
       <h2>Subscribed Data ({esc(snapshot.get("subscribed_metric_count"))})</h2>
       <table>
         <thead><tr><th>ID</th><th>Metric</th><th>Latest</th><th>Valid</th><th>Age</th></tr></thead>
@@ -1359,37 +1445,77 @@ class PiEdgeAgent:
     <div class="card full">
       <h2>Discovered GoFree Processors</h2>
       <ul>{discovered_items}</ul>
-    </div>
+    </div>{errors_html}
   </section>
+</main>
+</body>
+</html>"""
+
+    def render_local_status_error_html(self, exc: Exception) -> str:
+        message = html.escape(f"{type(exc).__name__}: {exc!s}" if str(exc) else type(exc).__name__)
+        return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Matador Pi Edge Local Status Error</title>
+  <style>
+    body {{ margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #071018; color: #eef6ff; }}
+    main {{ width: min(760px, calc(100% - 32px)); margin: 42px auto; background: #101a26; border: 1px solid #2d4054; border-radius: 18px; padding: 22px; }}
+    h1 {{ margin: 0 0 10px; font-size: 1.45rem; }}
+    p {{ color: #9db1c5; line-height: 1.5; }}
+    code {{ display: block; margin-top: 14px; padding: 14px; background: #071018; border: 1px solid #2d4054; border-radius: 12px; color: #fb7185; white-space: pre-wrap; }}
+  </style>
+</head>
+<body>
+<main>
+  <h1>Local status page error</h1>
+  <p>The Pi Edge Agent is running, but the local status page hit an internal rendering/request error. The full traceback is in the service journal.</p>
+  <code>{message}</code>
 </main>
 </body>
 </html>"""
 
     async def write_local_status_response(self, writer: asyncio.StreamWriter, status: str, content_type: str, body: str) -> None:
         encoded = body.encode("utf-8")
-        writer.write(
-            (
-                f"HTTP/1.1 {status}\r\n"
-                f"Content-Type: {content_type}; charset=utf-8\r\n"
-                f"Content-Length: {len(encoded)}\r\n"
-                "Cache-Control: no-store\r\n"
-                "Connection: close\r\n\r\n"
-            ).encode("ascii")
-            + encoded
-        )
-        await writer.drain()
-        writer.close()
-        with suppress(Exception):
-            await writer.wait_closed()
+        try:
+            writer.write(
+                (
+                    f"HTTP/1.1 {status}\r\n"
+                    f"Content-Type: {content_type}; charset=utf-8\r\n"
+                    f"Content-Length: {len(encoded)}\r\n"
+                    "Cache-Control: no-store\r\n"
+                    "Connection: close\r\n\r\n"
+                ).encode("ascii")
+                + encoded
+            )
+            await writer.drain()
+        finally:
+            writer.close()
+            with suppress(Exception):
+                await writer.wait_closed()
 
     async def handle_local_status_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
-            request = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=3.0)
-            request_line = request.decode("iso-8859-1", errors="ignore").splitlines()[0]
-            method, target, _ = (request_line.split(" ", 2) + ["", ""])[:3]
-            path = target.split("?", 1)[0]
+            request = await asyncio.wait_for(reader.read(8192), timeout=3.0)
+            request_lines = request.decode("iso-8859-1", errors="ignore").splitlines()
+            if not request_lines:
+                writer.close()
+                with suppress(Exception):
+                    await writer.wait_closed()
+                return
+            request_line = request_lines[0]
+            parts = request_line.split(" ", 2)
+            if len(parts) < 2:
+                await self.write_local_status_response(writer, "400 Bad Request", "text/plain", "Bad request")
+                return
+            method, target = parts[0], parts[1]
+            path = target.split("?", 1)[0] or "/"
             if method.upper() != "GET":
                 await self.write_local_status_response(writer, "405 Method Not Allowed", "text/plain", "Method not allowed")
+                return
+            if path == "/favicon.ico":
+                await self.write_local_status_response(writer, "404 Not Found", "text/plain", "Not found")
                 return
             snapshot = self.local_status_snapshot()
             if path in {"/api/status", "/status.json"}:
@@ -1401,10 +1527,19 @@ class PiEdgeAgent:
                 await self.write_local_status_response(writer, "200 OK", "text/html", self.render_local_status_html(snapshot))
             else:
                 await self.write_local_status_response(writer, "404 Not Found", "text/plain", "Not found")
-        except Exception as exc:
-            LOGGER.debug("Local status request failed: %s", exc)
+        except asyncio.TimeoutError as exc:
+            LOGGER.debug("Local status client sent no request before timeout: %r", exc)
+            writer.close()
             with suppress(Exception):
-                await self.write_local_status_response(writer, "500 Internal Server Error", "text/plain", "Local status error")
+                await writer.wait_closed()
+        except (BrokenPipeError, ConnectionResetError) as exc:
+            LOGGER.debug("Local status client disconnected before response completed: %r", exc)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            LOGGER.warning("Local status request failed", exc_info=True)
+            with suppress(Exception):
+                await self.write_local_status_response(writer, "500 Internal Server Error", "text/html", self.render_local_status_error_html(exc))
 
     async def local_status_loop(self) -> None:
         if self.local_status_port <= 0:
@@ -1494,6 +1629,20 @@ class PiEdgeAgent:
             str(wifi.get("ssid") or wifi.get("error") or "No active wlan0 SSID reported"),
             wifi,
         )
+        navico = self.navico_advertiser.status()
+        if not navico.get("enabled"):
+            navico_status = "warn"
+            navico_detail = "Navico HTML5 advertisement disabled"
+        elif navico.get("selected_address") and int(navico.get("send_count") or 0) > 0:
+            navico_status = "pass"
+            navico_detail = f"{navico.get('app_name')} advertised from {navico.get('selected_address')} on {navico.get('interface')}"
+        elif navico.get("last_error"):
+            navico_status = "fail"
+            navico_detail = str(navico.get("last_error"))
+        else:
+            navico_status = "warn"
+            navico_detail = f"waiting for {navico.get('interface')} IPv4 address or first send"
+        add("Navico HTML5 advertiser", navico_status, navico_detail, navico)
         reachability = self.matador_reachability()
         add(
             "Matador reachability",
@@ -1802,6 +1951,7 @@ class PiEdgeAgent:
             },
             "system": load_average(),
             "network": {**network_snapshot(), "egress": dict(self.network_path)},
+            "navico_html5_advertiser": self.navico_advertiser.status(),
             "update_timer": self.update_timer_state(),
             "update_result": self.update_result(),
             "counters": self.counters,
@@ -2302,6 +2452,7 @@ class PiEdgeAgent:
             self.stream_loop(),
             self.local_status_loop(),
             self.network_path_loop(),
+            self.navico_advertiser.run(self.stop_event),
         )
 
     async def network_path_loop(self) -> None:
@@ -2392,6 +2543,73 @@ def parse_args() -> argparse.Namespace:
         default=int(os.environ.get("MATADOR_PI_EDGE_LOCAL_STATUS_PORT", str(LOCAL_STATUS_PORT))),
         help="Port for the local Pi health web page. Default 8080; set 0 to disable.",
     )
+    parser.add_argument(
+        "--navico-advertiser-enabled",
+        default=os.environ.get("MATADOR_PI_EDGE_NAVICO_ADVERTISER_ENABLED", "true"),
+        help="Enable the Navico/B&G/Simrad/Lowrance HTML5 app advertisement. Default true.",
+    )
+    parser.add_argument(
+        "--navico-advertiser-interface",
+        default=os.environ.get("MATADOR_PI_EDGE_NAVICO_ADVERTISER_INTERFACE", "eth0"),
+        help="MFD-facing network interface used for the Navico HTML5 app advertisement. Default eth0.",
+    )
+    parser.add_argument(
+        "--navico-advertiser-interval-ms",
+        type=int,
+        default=int(os.environ.get("MATADOR_PI_EDGE_NAVICO_ADVERTISER_INTERVAL_MS", str(DEFAULT_INTERVAL_MS))),
+        help="Navico HTML5 app advertisement interval in milliseconds. Default 10000.",
+    )
+    parser.add_argument(
+        "--navico-advertiser-app-name",
+        default=os.environ.get("MATADOR_PI_EDGE_NAVICO_ADVERTISER_APP_NAME", "Matador"),
+        help="Tile name shown on compatible Navico/B&G/Simrad/Lowrance MFDs.",
+    )
+    parser.add_argument(
+        "--navico-advertiser-source",
+        default=os.environ.get("MATADOR_PI_EDGE_NAVICO_ADVERTISER_SOURCE", "TORO"),
+        help="Stable Navico descriptor Source value. Default TORO.",
+    )
+    parser.add_argument(
+        "--navico-advertiser-feature-name",
+        default=os.environ.get("MATADOR_PI_EDGE_NAVICO_ADVERTISER_FEATURE_NAME", "TORO HTML5 App"),
+        help="Stable Navico descriptor FeatureName value.",
+    )
+    parser.add_argument(
+        "--navico-advertiser-description",
+        default=os.environ.get("MATADOR_PI_EDGE_NAVICO_ADVERTISER_DESCRIPTION", "HTML5 app advertised to Navico, B&G, Simrad, and Lowrance MFDs."),
+        help="Navico descriptor English description.",
+    )
+    parser.add_argument(
+        "--navico-advertiser-app-url",
+        default=os.environ.get("MATADOR_PI_EDGE_NAVICO_ADVERTISER_APP_URL", DEFAULT_SERVER + "/"),
+        help="Absolute HTTP/HTTPS URL opened by the advertised MFD tile.",
+    )
+    parser.add_argument(
+        "--navico-advertiser-icon-path",
+        default=os.environ.get("MATADOR_PI_EDGE_NAVICO_ADVERTISER_ICON_PATH", DEFAULT_ICON_PATH),
+        help="Local icon HTTP path advertised to MFDs. Default /icon.png.",
+    )
+    parser.add_argument(
+        "--navico-advertiser-icon-revision",
+        default=os.environ.get("MATADOR_PI_EDGE_NAVICO_ADVERTISER_ICON_REVISION", DEFAULT_ICON_REVISION),
+        help="Stable icon cache-busting revision query value.",
+    )
+    parser.add_argument(
+        "--navico-advertiser-icon-file",
+        default=os.environ.get("MATADOR_PI_EDGE_NAVICO_ADVERTISER_ICON_FILE", str(Path(__file__).resolve().parents[1] / "public" / "icon.png")),
+        help="PNG icon file served locally to MFDs.",
+    )
+    parser.add_argument(
+        "--navico-advertiser-icon-http-port",
+        type=int,
+        default=int(os.environ.get("MATADOR_PI_EDGE_NAVICO_ADVERTISER_ICON_HTTP_PORT", str(DEFAULT_ICON_HTTP_PORT))),
+        help="Local icon HTTP port. Default 80, matching the Zeus hardware test.",
+    )
+    parser.add_argument(
+        "--navico-advertiser-only-show-on-client-ip",
+        default=os.environ.get("MATADOR_PI_EDGE_NAVICO_ADVERTISER_ONLY_SHOW_ON_CLIENT_IP", "true"),
+        help="Serialize OnlyShowOnClientIP as true/false. Default true.",
+    )
     parser.add_argument("--discover-once", action="store_true", help="Print discovered GoFree processors and exit")
     parser.add_argument("--log-level", default=os.environ.get("MATADOR_PI_EDGE_LOG_LEVEL", "INFO"), help="Python logging level")
     return parser.parse_args()
@@ -2426,6 +2644,24 @@ def main() -> None:
         storage_sample_hz=args.storage_sample_hz,
         local_status_host=args.local_status_host,
         local_status_port=args.local_status_port,
+        navico_advertiser_settings=NavicoAdvertiserSettings(
+            enabled=parse_navico_bool(args.navico_advertiser_enabled, name="MATADOR_PI_EDGE_NAVICO_ADVERTISER_ENABLED"),
+            interface=args.navico_advertiser_interface,
+            interval_ms=args.navico_advertiser_interval_ms,
+            app_name=args.navico_advertiser_app_name,
+            source=args.navico_advertiser_source,
+            feature_name=args.navico_advertiser_feature_name,
+            description=args.navico_advertiser_description,
+            app_url=args.navico_advertiser_app_url,
+            icon_path=args.navico_advertiser_icon_path,
+            icon_revision=args.navico_advertiser_icon_revision,
+            icon_file=Path(args.navico_advertiser_icon_file),
+            icon_http_port=args.navico_advertiser_icon_http_port,
+            only_show_on_client_ip=parse_navico_bool(
+                args.navico_advertiser_only_show_on_client_ip,
+                name="MATADOR_PI_EDGE_NAVICO_ADVERTISER_ONLY_SHOW_ON_CLIENT_IP",
+            ),
+        ),
     )
     try:
         asyncio.run(agent.run())

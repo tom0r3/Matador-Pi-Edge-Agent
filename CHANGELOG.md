@@ -4,6 +4,21 @@ All notable project changes will be recorded here.
 
 ## Unreleased
 
+- Added an integrated Navico HTML5 app advertiser for Pi appliances. The
+  production profile sends the proven `Matador` descriptor to
+  `239.2.1.1:2053` from the configured MFD-facing interface, defaults to
+  `eth0`, serves the versioned TORO favicon locally on port `80`, and opens
+  `https://matador.torodatasystems.eu/` directly from compatible B&G, Simrad,
+  and Lowrance MFD tiles.
+- Added Navico advertiser diagnostics to Pi health, the local Pi status page,
+  self-test output, and `scripts/status.sh`, including selected interface,
+  selected address, payload, send counters, last send, and last error.
+- Added focused stdlib unit tests for the Navico descriptor, production
+  profile guardrails, scheduling behaviour, missing-interface failure, and
+  icon endpoint query-string handling.
+- Updated the systemd unit to grant only `CAP_NET_BIND_SERVICE` so the
+  unprivileged Pi agent can serve the MFD icon on port `80`.
+
 ## 2026-07-13 - Version 3.6.2
 
 - Moved Pi Edge GoFree setting subscriptions to the server-provided
@@ -16,17 +31,17 @@ All notable project changes will be recorded here.
   changes the requested setting IDs, port, path, or metric list.
 
 - Added a lightweight local Pi Edge health web page on port `8080` with
--  connectivity, queue, Pi health, processor lock, discovery, and subscribed
--  metric status, plus JSON endpoints at `/api/status` and `/health`.
+  connectivity, queue, Pi health, processor lock, discovery, and subscribed
+  metric status, plus JSON endpoints at `/api/status` and `/health`.
 - Hardened the local Pi Edge health page so transient snapshot/render failures
--  show as page warnings and normal service logs instead of returning a generic
--  `Local status error`.
+  show as page warnings and normal service logs instead of returning a generic
+  `Local status error`.
 - Changed the local Pi Edge health page request handler to ignore normal browser
--  disconnects, log full tracebacks for genuine page errors, and render an
--  explanatory local error page if an internal status-page failure still occurs.
+  disconnects, log full tracebacks for genuine page errors, and render an
+  explanatory local error page if an internal status-page failure still occurs.
 - Fixed browser speculative/preload sockets timing out before sending a request
--  so they are closed quietly instead of being rendered as a visible
--  `TimeoutError` page.
+  so they are closed quietly instead of being rendered as a visible
+  `TimeoutError` page.
 
 ## 2026-07-11 - Version 3.6.0
 

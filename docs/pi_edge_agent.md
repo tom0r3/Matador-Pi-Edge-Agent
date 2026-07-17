@@ -98,6 +98,13 @@ failed lookup, is reported as `unknown` and shows no status mark.
   Normal browser/preload disconnects and speculative sockets that send no
   request are ignored, while genuine local-page failures are logged with a
   traceback and shown as an explanatory error page.
+- Advertises a Navico HTML5 `Matador` tile to compatible B&G, Simrad, and
+  Lowrance MFDs by sending the capture-derived descriptor to
+  `239.2.1.1:2053` every 10 seconds from the configured MFD-facing interface,
+  normally `eth0`. The tile opens `https://matador.torodatasystems.eu/`
+  directly and uses the local versioned TORO favicon served from port `80`.
+  The production profile intentionally does not send TORO UDP `2052`, mDNS, or
+  `navico-nav-ws` compatibility announcements.
 - Self-test probes Matador `/edge/health` reachability so support can
   distinguish local processor issues from internet/server reachability issues.
 - Source Diagnostics shows latest Pi-backed telemetry rows, metric freshness,
@@ -157,6 +164,17 @@ MATADOR_PI_EDGE_UPLOAD_BATCH_MAX_READINGS=250
 MATADOR_PI_EDGE_UPLOAD_BATCH_MAX_PAYLOADS=50
 MATADOR_PI_EDGE_LOCAL_STATUS_HOST=0.0.0.0
 MATADOR_PI_EDGE_LOCAL_STATUS_PORT=8080
+MATADOR_PI_EDGE_NAVICO_ADVERTISER_ENABLED=true
+MATADOR_PI_EDGE_NAVICO_ADVERTISER_INTERFACE=eth0
+MATADOR_PI_EDGE_NAVICO_ADVERTISER_INTERVAL_MS=10000
+MATADOR_PI_EDGE_NAVICO_ADVERTISER_APP_NAME=Matador
+MATADOR_PI_EDGE_NAVICO_ADVERTISER_SOURCE=TORO
+MATADOR_PI_EDGE_NAVICO_ADVERTISER_FEATURE_NAME=TORO HTML5 App
+MATADOR_PI_EDGE_NAVICO_ADVERTISER_APP_URL=https://matador.torodatasystems.eu/
+MATADOR_PI_EDGE_NAVICO_ADVERTISER_ICON_PATH=/icon.png
+MATADOR_PI_EDGE_NAVICO_ADVERTISER_ICON_REVISION=toro-favicon-1
+MATADOR_PI_EDGE_NAVICO_ADVERTISER_ICON_HTTP_PORT=80
+MATADOR_PI_EDGE_NAVICO_ADVERTISER_ONLY_SHOW_ON_CLIENT_IP=true
 MATADOR_PI_EDGE_LOG_LEVEL=INFO
 ```
 
@@ -207,6 +225,67 @@ sudo journalctl -u matador-pi-edge-agent.service --since "10 minutes ago" --no-p
 Set `MATADOR_PI_EDGE_LOCAL_STATUS_PORT=0` in
 `/etc/matador-pi-edge-agent.env` and restart the service if a local web page is
 not wanted on a particular installation.
+
+## Navico HTML5 MFD Advertisement
+
+The Pi advertises a `Matador` HTML5 tile for compatible Navico-family MFDs
+using the Zeus S 7 hardware-tested production profile:
+
+- Multicast destination: `239.2.1.1`.
+- UDP destination port: `2053`.
+- First send: immediately after the MFD-facing interface has an IPv4 address.
+- Repeat interval: `10000` ms.
+- Default MFD-facing interface: `eth0`.
+- Icon URL: `http://<pi-mfd-address>/icon.png?v=toro-favicon-1`.
+- App URL: `https://matador.torodatasystems.eu/`.
+- Disabled by design: TORO UDP `2052`, mDNS `5353`, and `navico-nav-ws`.
+
+The advertised descriptor is visible to every host on the MFD LAN and contains
+no credentials, cookies, or device tokens. The MFD itself must have DNS,
+gateway, internet access, a valid clock, compatible TLS support, and trusted
+certificate authorities to open Matador.
+
+Production should set the MFD-facing adapter explicitly with:
+
+```bash
+MATADOR_PI_EDGE_NAVICO_ADVERTISER_INTERFACE=eth0
+```
+
+If that interface does not exist, the agent fails fast instead of silently
+advertising on Wi-Fi, VPN, Docker, loopback, or a management-only interface. If
+the interface exists but has no IPv4 address yet, the advertiser waits and
+retries. IPv4 link-local addresses such as `169.254.x.x` are valid.
+
+The systemd service grants only `CAP_NET_BIND_SERVICE` so the unprivileged
+`matador-edge` service user can serve `/icon.png` on port `80`. If another
+service owns port `80`, either serve `public/icon.png` from that existing web
+server or change `MATADOR_PI_EDGE_NAVICO_ADVERTISER_ICON_HTTP_PORT` and repeat
+the Zeus acceptance test.
+
+Useful local checks:
+
+```bash
+sudo /opt/matador-pi-edge-agent/scripts/status.sh
+curl -I "http://PI_MFD_ADDRESS/icon.png?v=toro-favicon-1"
+sudo tcpdump -ni eth0 -A 'udp dst host 239.2.1.1 and dst port 2053'
+```
+
+Hardware acceptance sequence:
+
+1. Confirm the Pi and MFD share the MFD LAN.
+2. Confirm the MFD has DNS, gateway, internet access, and correct time.
+3. Start or update the Pi agent and inspect the local status Navico card.
+4. Capture at least 30 seconds on the MFD-facing interface.
+5. Verify packets go only to `239.2.1.1:2053` every 10 seconds.
+6. Verify no TORO packets are sent to UDP `2052` or `224.0.0.251:5353`.
+7. Fully reboot the MFD to avoid relying on cached tiles.
+8. Confirm one `Matador` tile appears with the compact TORO favicon.
+9. Open the tile and confirm `https://matador.torodatasystems.eu/` loads.
+10. Test login, cookies, logout, session recovery, and the on-screen keyboard.
+11. Test internet loss/recovery while the local tile remains advertised.
+12. Restart the Pi agent and confirm the tile recovers.
+13. Disconnect/reconnect the MFD-facing Ethernet cable.
+14. Run a 30 to 60 minute soak test with stable counters and no error growth.
 
 Update from GitHub:
 

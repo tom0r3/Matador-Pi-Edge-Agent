@@ -58,7 +58,16 @@ if (-not $SkipPython) {
   Invoke-Native $Python @(
     "-m",
     "py_compile",
-    "edge_agent\pi_edge_agent.py"
+    "edge_agent\pi_edge_agent.py",
+    "edge_agent\navico_advertiser.py"
+  )
+  Write-Step "Python tests"
+  Invoke-Native $Python @(
+    "-m",
+    "unittest",
+    "discover",
+    "-s",
+    "tests"
   )
 }
 
@@ -83,16 +92,23 @@ if (-not $SkipDiffCheck) {
   if ($Git) {
     Write-Step "Git whitespace check"
     Invoke-Native $Git @(
+      "-c",
+      "safe.directory=$RepoRoot",
+      "-C",
+      $RepoRoot,
       "diff",
       "--check",
       "--",
       "edge_agent/pi_edge_agent.py",
+      "edge_agent/navico_advertiser.py",
+      "tests/test_navico_advertiser.py",
       "README.md",
       "CHANGELOG.md",
       "VERSION",
       "scripts/update.sh",
       "scripts/install.sh",
       "scripts/status.sh",
+      "deploy/matador-pi-edge-agent.service",
       "scripts/dev-check.ps1",
       "scripts/dev-check.sh"
     )
