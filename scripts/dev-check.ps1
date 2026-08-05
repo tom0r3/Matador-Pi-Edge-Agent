@@ -35,9 +35,17 @@ function Invoke-Native {
     [string]$FilePath,
     [string[]]$Arguments
   )
-  & $FilePath @Arguments
-  if ($LASTEXITCODE -ne 0) {
-    throw "$FilePath failed with exit code $LASTEXITCODE"
+  $previousErrorActionPreference = $ErrorActionPreference
+  try {
+    # Native tools can write warnings to stderr while still succeeding.
+    $ErrorActionPreference = "Continue"
+    & $FilePath @Arguments
+    $exitCode = $LASTEXITCODE
+  } finally {
+    $ErrorActionPreference = $previousErrorActionPreference
+  }
+  if ($exitCode -ne 0) {
+    throw "$FilePath failed with exit code $exitCode"
   }
 }
 
@@ -59,7 +67,8 @@ if (-not $SkipPython) {
     "-m",
     "py_compile",
     "edge_agent\pi_edge_agent.py",
-    "edge_agent\navico_advertiser.py"
+    "edge_agent\navico_advertiser.py",
+    "edge_agent\remote_channel_protocol.py"
   )
   Write-Step "Python tests"
   Invoke-Native $Python @(
@@ -101,7 +110,9 @@ if (-not $SkipDiffCheck) {
       "--",
       "edge_agent/pi_edge_agent.py",
       "edge_agent/navico_advertiser.py",
+      "edge_agent/remote_channel_protocol.py",
       "tests/test_navico_advertiser.py",
+      "tests/test_remote_channel_protocol.py",
       "README.md",
       "CHANGELOG.md",
       "VERSION",

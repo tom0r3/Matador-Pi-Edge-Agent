@@ -3,7 +3,6 @@
 All notable project changes will be recorded here.
 
 ## Unreleased
-
 - Added an integrated Navico HTML5 app advertiser for Pi appliances. The
   production profile sends the proven `Matador` descriptor to
   `239.2.1.1:2053` from the configured MFD-facing interface, defaults to
@@ -18,6 +17,26 @@ All notable project changes will be recorded here.
   icon endpoint query-string handling.
 - Updated the systemd unit to grant only `CAP_NET_BIND_SERVICE` so the
   unprivileged Pi agent can serve the MFD icon on port `80`.
+
+## 2026-08-05 - Version 3.7.0
+
+- Added the fail-closed Remote Channels Edge transport. Pi agents poll a
+  one-command server mailbox on their normal upstream heartbeat, verify the
+  HMAC signature, processor UUID, expiry, action, and Linear Channel ID range,
+  execute only server-generated GoFree frames, and return explicit completion
+  evidence or a failure acknowledgement.
+- Added guarded Hercules User Data caption configuration through Setting `91`
+  and Event `25`, including writable-setting preflight and exact caption
+  readback before a target can be validated.
+- Added one-second idle upstream heartbeats so short-lived Remote Channels
+  commands and acknowledgements are delivered even when no telemetry values
+  are changing. Local GoFree reconnects fail any active command rather than
+  allowing it to appear successful after a partial operation.
+- Added Remote Channels protocol tests for signature tampering, expiry, target
+  binding, reserved channel limits, malformed acknowledgements, temporary
+  writes, and persistent caption verification.
+- Hardened the PowerShell development check so successful native tools may emit
+  warnings on stderr without being reported as failures.
 
 ## 2026-07-13 - Version 3.6.2
 

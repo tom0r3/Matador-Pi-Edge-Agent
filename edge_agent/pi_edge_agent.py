@@ -36,9 +36,22 @@ from edge_agent.navico_advertiser import (
     parse_bool as parse_navico_bool,
 )
 
+try:
+    from remote_channel_protocol import (
+        RemoteChannelCommandExecutor,
+        command_ack,
+        verify_command,
+    )
+except ImportError:  # Package import during normal service and tests.
+    from edge_agent.remote_channel_protocol import (
+        RemoteChannelCommandExecutor,
+        command_ack,
+        verify_command,
+    )
+
 
 APP_NAME = "Matador Pi Edge Agent"
-DEFAULT_APP_VERSION = "3.6.2"
+DEFAULT_APP_VERSION = "3.7.0"
 DEFAULT_SERVER = "https://matador.torodatasystems.eu"
 GOFREE_DISCOVERY_GROUP = "239.2.1.1"
 GOFREE_DISCOVERY_PORTS = (2052, 2050)
@@ -731,6 +744,10 @@ class PiEdgeAgent:
         }
         self.latest_values_by_metric: dict[str, dict[str, Any]] = {}
         self.live_payload_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=100)
+        self.remote_channel_command_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=1)
+        self.remote_channel_executor = RemoteChannelCommandExecutor()
+        self.remote_channel_ack: dict[str, Any] | None = None
+        self.remote_channel_seen_ids: set[str] = set()
         self._storage_sample_bucket: int | None = None
         self._storage_sample_payload: dict[str, Any] | None = None
         self._storage_sample_items: dict[tuple[int, int], dict[str, Any]] = {}
@@ -1977,6 +1994,69 @@ class PiEdgeAgent:
     def config(self) -> dict[str, Any]:
         return self.current_config or self.state.get("config") or {}
 
+    def configured_processor_id(self) -> str:
+        processor = self.config().get("processor") or {}
+        return str(processor.get("id") or "").strip()
+
+    def set_remote_channel_ack(self, acknowledgement: dict[str, Any] | None) -> None:
+        if acknowledgement is not None:
+            self.remote_channel_ack = dict(acknowledgement)
+
+    def accept_remote_channel_command(self, response: dict[str, Any]) -> None:
+        raw_command = response.get("remote_channel_command")
+        if raw_command is None:
+            return
+        command_id = str(raw_command.get("command_id") or "") if isinstance(raw_command, dict) else ""
+        if command_id and command_id in self.remote_channel_seen_ids:
+            return
+        try:
+            command = verify_command(raw_command, self.device_token, self.configured_processor_id())
+        except Exception as exc:
+            LOGGER.warning("Rejected Remote Channels command: %s", exc)
+            if isinstance(raw_command, dict) and command_id:
+                self.remote_channel_seen_ids.add(command_id)
+                self.set_remote_channel_ack(command_ack(raw_command, status="rejected", error=str(exc)))
+            return
+        self.remote_channel_seen_ids.add(command_id)
+        if len(self.remote_channel_seen_ids) > 256:
+            self.remote_channel_seen_ids = {command_id}
+        if self.remote_channel_command_queue.full():
+            with suppress(asyncio.QueueEmpty):
+                replaced = self.remote_channel_command_queue.get_nowait()
+                self.set_remote_channel_ack(
+                    command_ack(replaced, status="failed", error="Superseded before local execution")
+                )
+        self.remote_channel_command_queue.put_nowait(command)
+
+    async def send_remote_channel_plan(self, websocket: Any, plan: Any) -> None:
+        try:
+            for frame in plan.frames:
+                await websocket.send(frame)
+        except Exception as exc:
+            self.set_remote_channel_ack(self.remote_channel_executor.fail(f"Local GoFree write failed: {exc}"))
+            raise
+        self.set_remote_channel_ack(self.remote_channel_executor.sent(plan))
+
+    async def service_remote_channel_command(self, websocket: Any, payload: dict[str, Any] | None = None) -> None:
+        if self.remote_channel_executor.active_command is None:
+            with suppress(asyncio.QueueEmpty):
+                queued = self.remote_channel_command_queue.get_nowait()
+                try:
+                    command = verify_command(queued, self.device_token, self.configured_processor_id())
+                    await self.send_remote_channel_plan(websocket, self.remote_channel_executor.start(command))
+                except Exception as exc:
+                    LOGGER.warning("Remote Channels command could not start: %s", exc)
+                    if self.remote_channel_executor.active_command is not None:
+                        self.set_remote_channel_ack(self.remote_channel_executor.fail(str(exc)))
+                    else:
+                        self.set_remote_channel_ack(command_ack(queued, status="rejected", error=str(exc)))
+        if payload is not None and self.remote_channel_executor.active_command is not None:
+            plan, acknowledgement = self.remote_channel_executor.observe(payload)
+            self.set_remote_channel_ack(acknowledgement)
+            if plan is not None:
+                await self.send_remote_channel_plan(websocket, plan)
+        self.set_remote_channel_ack(self.remote_channel_executor.check_timeout())
+
     def locked_processor_identity(self) -> dict[str, Any] | None:
         config_lock = self.config().get("processor_lock")
         if isinstance(config_lock, dict) and config_lock:
@@ -2260,6 +2340,10 @@ class PiEdgeAgent:
                 backoff = min(backoff * 2, 60.0)
 
     async def processor_once(self, processor_host: str, processor_port: int, processor_path: str) -> None:
+        if self.remote_channel_executor.active_command is not None:
+            self.set_remote_channel_ack(
+                self.remote_channel_executor.fail("Local GoFree connection restarted during command execution")
+            )
         self.data_info_by_metric_id.clear()
         self.setting_by_id.clear()
         url = f"ws://{processor_host}:{processor_port}{processor_path or '/'}"
@@ -2280,6 +2364,7 @@ class PiEdgeAgent:
             self.processor_connection_status = f"connected {processor_host}:{processor_port}"
             LOGGER.info("Subscribed to %s GoFree metrics", len(self.subscription_metrics()))
             while not self.stop_event.is_set() and self.processor_enabled:
+                await self.service_remote_channel_command(websocket)
                 if self.processor_reconnect_requested:
                     self.processor_reconnect_requested = False
                     raise RuntimeError("Processor reconnect requested by Matador admin")
@@ -2297,6 +2382,7 @@ class PiEdgeAgent:
                 except TimeoutError:
                     continue
                 payload = json.loads(message.decode("utf-8") if isinstance(message, bytes) else message)
+                await self.service_remote_channel_command(websocket, payload)
                 if self.update_data_info(payload) or self.update_settings(payload):
                     LOGGER.debug("Updated GoFree processor metadata")
                     continue
@@ -2387,12 +2473,19 @@ class PiEdgeAgent:
         return first_payload
 
     async def send_upstream_payload(self, websocket: Any, outgoing: dict[str, Any], *, timeout_seconds: float = 15.0) -> dict[str, Any]:
+        acknowledgement = dict(self.remote_channel_ack) if self.remote_channel_ack is not None else None
+        if acknowledgement is not None:
+            outgoing["remote_channel_ack"] = acknowledgement
         outgoing["pi_health"] = self.health_payload()
         await websocket.send(json.dumps(outgoing, separators=(",", ":")))
         response_text = await asyncio.wait_for(websocket.recv(), timeout=timeout_seconds)
         response = json.loads(response_text)
         if not response.get("ok", False):
             raise RuntimeError(str(response.get("error") or "Matador rejected Edge payload"))
+        if acknowledgement is not None and self.remote_channel_ack is not None:
+            if self.remote_channel_ack.get("command_id") == acknowledgement.get("command_id"):
+                self.remote_channel_ack = None
+        self.accept_remote_channel_command(response)
         return response
 
     async def stream_once(self) -> None:
@@ -2406,6 +2499,7 @@ class PiEdgeAgent:
             LOGGER.info("Upstream Matador stream connected")
             self.upstream_connection_status = "connected"
             self.state["last_upstream_connected_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            last_upstream_contact = 0.0
             while not self.stop_event.is_set() and self.streaming_enabled:
                 if self.upload_paused:
                     return
@@ -2418,6 +2512,7 @@ class PiEdgeAgent:
                     self.state["last_upload_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
                     self.save_state()
                     sent_live_payload = True
+                    last_upstream_contact = time.monotonic()
                 rows = await asyncio.to_thread(
                     self.spool.peek_oldest_batch,
                     self.upload_batch_max_payloads,
@@ -2426,6 +2521,18 @@ class PiEdgeAgent:
                 if not rows:
                     if sent_live_payload:
                         continue
+                    if self.remote_channel_ack is not None or time.monotonic() - last_upstream_contact >= 1.0:
+                        heartbeat = {
+                            "agent_kind": "pi_edge_agent",
+                            "app_version": APP_VERSION,
+                            "client_hostname": hostname(),
+                            "processor_host": self.state.get("last_processor_host") or "0.0.0.0",
+                            "processor_identity": self.current_processor_identity or None,
+                            "sent_at": time.time(),
+                            "Data": [],
+                        }
+                        await self.send_upstream_payload(websocket, heartbeat, timeout_seconds=5.0)
+                        last_upstream_contact = time.monotonic()
                     await asyncio.sleep(IDLE_SLEEP_SECONDS)
                     continue
                 payload_ids = [payload_id for payload_id, _ in rows]
@@ -2436,6 +2543,7 @@ class PiEdgeAgent:
                     self.increment_counter("upstream_payloads_failed", len(rows))
                     raise
                 await asyncio.to_thread(self.spool.ack_many, payload_ids)
+                last_upstream_contact = time.monotonic()
                 self.increment_counter("upstream_batches_sent")
                 self.increment_counter("upstream_payloads_sent", len(rows))
                 self.increment_counter("upstream_readings_sent", len(outgoing.get("Data") or []))

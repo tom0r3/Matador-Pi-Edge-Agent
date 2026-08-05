@@ -45,7 +45,8 @@ step() {
 step "Python compile"
 "$PYTHON_BIN" -m py_compile \
   edge_agent/pi_edge_agent.py \
-  edge_agent/navico_advertiser.py
+  edge_agent/navico_advertiser.py \
+  edge_agent/remote_channel_protocol.py
 
 step "Python tests"
 "$PYTHON_BIN" -m unittest discover -s tests
@@ -73,7 +74,9 @@ if command -v git >/dev/null 2>&1; then
   git -c "safe.directory=$ROOT_DIR" -C "$ROOT_DIR" diff --check -- \
     edge_agent/pi_edge_agent.py \
     edge_agent/navico_advertiser.py \
+    edge_agent/remote_channel_protocol.py \
     tests/test_navico_advertiser.py \
+    tests/test_remote_channel_protocol.py \
     README.md \
     CHANGELOG.md \
     VERSION \

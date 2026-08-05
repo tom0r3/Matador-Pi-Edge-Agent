@@ -1,6 +1,16 @@
 # Matador
 
-Current release: `Version 3.6.2`
+Current release: `Version 3.7.0`
+
+`Version 3.7.0` adds the Remote Channels Edge transport for enrolled B&G
+GoFree/Hercules targets. Commands arrive through the existing Matador stream,
+are signed with the enrollment token and bound to the exact processor UUID,
+profile revision, lease generation, and expiry, and can write only Linear
+Channels `481-490`. The Pi performs writable Setting `91` preflight and exact
+caption readback, reports an explicit acknowledgement, and fails an in-flight
+command if its local GoFree connection restarts. This path remains inactive
+unless the Matador team feature, validated target, active profile, target
+lease, and server-wide write interlock all permit it.
 
 `Version 3.6.2` receives its read-only GoFree setting subscriptions from the
 Matador server. The server controls the requested setting IDs through
