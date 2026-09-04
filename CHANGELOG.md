@@ -2,6 +2,27 @@
 
 All notable project changes will be recorded here.
 
+## 2026-09-04 - Version 3.7.2
+
+- Forward valid GoFree Setting `31` (mast height above waterline) in each live
+  upstream payload for Matador's existing 10 m wind correction.
+- Process both `DataInfo` and `Setting` sections when GoFree supplies them in
+  the same websocket frame. The previous short-circuit could silently discard
+  Setting `31` after a successful `DataInfo` update.
+- Validate mast height as a finite value between 0 and 150 metres and cover a
+  combined metadata reply with a regression test.
+
+## 2026-08-05 - Version 3.7.1
+
+- Process local Hercules websocket messages every 200 ms while a Remote
+  Channels command is queued or active, retaining the one-second idle cycle
+  during normal telemetry operation.
+- Added action-specific safety windows: 60 seconds for guarded caption
+  configuration, five seconds for live values, and 15 seconds for fail-safe
+  invalidation.
+- Keeps validation and cleanup compatible with Matador Server `4.10.1`, which
+  requires explicit command and invalidation acknowledgements.
+
 ## Unreleased
 - Added an integrated Navico HTML5 app advertiser for Pi appliances. The
   production profile sends the proven `Matador` descriptor to

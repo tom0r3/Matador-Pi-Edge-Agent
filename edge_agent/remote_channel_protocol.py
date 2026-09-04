@@ -87,7 +87,11 @@ def verify_command(
         raise RemoteChannelCommandError("Edge command issue time is in the future")
     if expires_at <= current:
         raise RemoteChannelCommandError("Edge command has expired")
-    maximum_lifetime = 60.0 if action == "configure" else 5.0
+    maximum_lifetime = {
+        "configure": 60.0,
+        "invalidate": 15.0,
+        "write": 5.0,
+    }[action]
     lifetime = (expires_at - issued_at).total_seconds()
     if lifetime <= 0 or lifetime > maximum_lifetime:
         raise RemoteChannelCommandError("Edge command lifetime exceeds its safety limit")

@@ -1,10 +1,26 @@
 # Matador Pi Edge Agent
 
 The Matador Pi Edge Agent is the headless Raspberry Pi companion to the
-Windows Matador Edge Agent. Version 3.6.0 is the current production baseline:
+Windows Matador Edge Agent. Version 3.7.2 is the current production baseline:
 unattended operation, discovery, durable offline spooling, remote commands,
 health/storage telemetry, no-code admin claiming, golden-image preparation,
 and remote diagnostics/maintenance from Matador Admin.
+
+## Version 3.7.2 Mast Height Forwarding
+
+Version `3.7.2` forwards valid GoFree Setting `31` (mast height above
+waterline) as `processor_settings.mast_height_above_wl_m`. It processes both
+`DataInfo` and `Setting` metadata sections when they share a GoFree websocket
+frame, allowing Matador to apply its team-enabled 10 m wind correction without
+a manual duplicate mast-height entry.
+
+## Version 3.7.1 Remote Channels Reliability
+
+Version `3.7.1` shortens the local Hercules receive interval to 200 ms while a
+Remote Channels command is queued or active. Configuration, live values, and
+fail-safe invalidation use separate bounded command lifetimes so Matador can
+complete validation and receive cleanup evidence without weakening the expiry
+guard on live routed data.
 
 ## Public Network Classification
 

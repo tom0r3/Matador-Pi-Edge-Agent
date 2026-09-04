@@ -7,6 +7,7 @@ import hashlib
 import html
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -51,7 +52,7 @@ except ImportError:  # Package import during normal service and tests.
 
 
 APP_NAME = "Matador Pi Edge Agent"
-DEFAULT_APP_VERSION = "3.7.0"
+DEFAULT_APP_VERSION = "3.7.2"
 DEFAULT_SERVER = "https://matador.torodatasystems.eu"
 GOFREE_DISCOVERY_GROUP = "239.2.1.1"
 GOFREE_DISCOVERY_PORTS = (2052, 2050)
@@ -2275,12 +2276,28 @@ class PiEdgeAgent:
             self.refresh_processor_identity_from_settings()
         return updated
 
+    def update_processor_metadata(self, payload: dict[str, Any]) -> bool:
+        """Record every metadata section supplied in a single GoFree frame."""
+        data_info_updated = self.update_data_info(payload)
+        settings_updated = self.update_settings(payload)
+        return data_info_updated or settings_updated
+
     def metric_name_by_id(self) -> dict[int, str]:
         return {
             int(item["id"]): str(item.get("name") or "")
             for item in self.subscription_metrics()
             if int_or_none(item.get("id")) is not None
         }
+
+    def mast_height_above_wl_m(self) -> float | None:
+        setting = self.setting_by_id.get(GOFREE_MAST_HEIGHT_ABOVE_WL_SETTING_ID)
+        if not setting:
+            return None
+        for key in ("value", "val", "current", "dampedVal"):
+            value = float_or_none(setting.get(key))
+            if value is not None and math.isfinite(value) and 0 < value <= 150:
+                return value
+        return None
 
     def compass_reference(self) -> str | None:
         setting = self.setting_by_id.get(GOFREE_COMPASS_TRUE_MAG_SETTING_ID)
@@ -2378,12 +2395,19 @@ class PiEdgeAgent:
                     await self.request_metadata(websocket)
                     last_metadata_request = time.monotonic()
                 try:
-                    message = await asyncio.wait_for(websocket.recv(), timeout=1.0)
+                    command_waiting = (
+                        self.remote_channel_executor.active_command is not None
+                        or not self.remote_channel_commands.empty()
+                    )
+                    message = await asyncio.wait_for(
+                        websocket.recv(),
+                        timeout=0.2 if command_waiting else 1.0,
+                    )
                 except TimeoutError:
                     continue
                 payload = json.loads(message.decode("utf-8") if isinstance(message, bytes) else message)
                 await self.service_remote_channel_command(websocket, payload)
-                if self.update_data_info(payload) or self.update_settings(payload):
+                if self.update_processor_metadata(payload):
                     LOGGER.debug("Updated GoFree processor metadata")
                     continue
                 values = payload.get("Data") or []
@@ -2398,6 +2422,9 @@ class PiEdgeAgent:
                     "client_hostname": hostname(),
                     "processor_host": processor_host,
                     "processor_identity": self.current_processor_identity or None,
+                    "processor_settings": {
+                        "mast_height_above_wl_m": self.mast_height_above_wl_m(),
+                    },
                     "sent_at": time.time(),
                     "Data": [
                         self.enrich_data_item(item)

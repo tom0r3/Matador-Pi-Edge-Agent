@@ -1,6 +1,17 @@
 # Matador
 
-Current release: `Version 3.7.0`
+Current release: `Version 3.7.2`
+
+`Version 3.7.2` forwards valid GoFree Setting `31` mast-height data to Matador
+for the existing 10 m wind correction. It safely processes `DataInfo` and
+`Setting` when they arrive in the same websocket frame, so the mast-height
+setting cannot be skipped by metadata handling. No manual mast-height override
+is required when the processor reports a valid value.
+
+`Version 3.7.1` improves Remote Channels command reliability. While a command
+is queued or active, the Pi shortens its local Hercules receive interval to
+200 ms and applies separate bounded lifetimes for configuration, live values,
+and fail-safe invalidation. Normal telemetry retains its one-second idle cycle.
 
 `Version 3.7.0` adds the Remote Channels Edge transport for enrolled B&G
 GoFree/Hercules targets. Commands arrive through the existing Matador stream,
