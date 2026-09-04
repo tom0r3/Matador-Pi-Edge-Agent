@@ -1,6 +1,10 @@
 # Matador
 
-Current release: `Version 3.7.2`
+Current release: `Version 3.7.3`
+
+`Version 3.7.3` restores normal Pi GoFree telemetry after the `3.7.2` release.
+It corrects the Remote Channels command-queue reference used by the receive
+loop, so an idle Pi stays subscribed and continues to forward data.
 
 `Version 3.7.2` forwards valid GoFree Setting `31` mast-height data to Matador
 for the existing 10 m wind correction. It safely processes `DataInfo` and

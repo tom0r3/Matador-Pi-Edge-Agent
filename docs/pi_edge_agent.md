@@ -1,10 +1,17 @@
 # Matador Pi Edge Agent
 
 The Matador Pi Edge Agent is the headless Raspberry Pi companion to the
-Windows Matador Edge Agent. Version 3.7.2 is the current production baseline:
+Windows Matador Edge Agent. Version 3.7.3 is the current production baseline:
 unattended operation, discovery, durable offline spooling, remote commands,
 health/storage telemetry, no-code admin claiming, golden-image preparation,
 and remote diagnostics/maintenance from Matador Admin.
+
+## Version 3.7.3 GoFree Receive Recovery
+
+Version `3.7.3` fixes the Remote Channels queue reference in the GoFree receive
+loop. Pi agents now continue receiving ordinary GoFree telemetry while no
+Remote Channels command is pending; the fast 200 ms receive interval is used
+only when the initialized command queue has work.
 
 ## Version 3.7.2 Mast Height Forwarding
 

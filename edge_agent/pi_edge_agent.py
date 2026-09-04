@@ -52,7 +52,7 @@ except ImportError:  # Package import during normal service and tests.
 
 
 APP_NAME = "Matador Pi Edge Agent"
-DEFAULT_APP_VERSION = "3.7.2"
+DEFAULT_APP_VERSION = "3.7.3"
 DEFAULT_SERVER = "https://matador.torodatasystems.eu"
 GOFREE_DISCOVERY_GROUP = "239.2.1.1"
 GOFREE_DISCOVERY_PORTS = (2052, 2050)
@@ -2003,6 +2003,12 @@ class PiEdgeAgent:
         if acknowledgement is not None:
             self.remote_channel_ack = dict(acknowledgement)
 
+    def remote_channel_command_waiting(self) -> bool:
+        return (
+            self.remote_channel_executor.active_command is not None
+            or not self.remote_channel_command_queue.empty()
+        )
+
     def accept_remote_channel_command(self, response: dict[str, Any]) -> None:
         raw_command = response.get("remote_channel_command")
         if raw_command is None:
@@ -2395,10 +2401,7 @@ class PiEdgeAgent:
                     await self.request_metadata(websocket)
                     last_metadata_request = time.monotonic()
                 try:
-                    command_waiting = (
-                        self.remote_channel_executor.active_command is not None
-                        or not self.remote_channel_commands.empty()
-                    )
+                    command_waiting = self.remote_channel_command_waiting()
                     message = await asyncio.wait_for(
                         websocket.recv(),
                         timeout=0.2 if command_waiting else 1.0,

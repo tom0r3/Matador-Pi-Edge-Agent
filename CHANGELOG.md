@@ -2,6 +2,15 @@
 
 All notable project changes will be recorded here.
 
+## 2026-09-04 - Version 3.7.3
+
+- Fixed the Pi GoFree receive loop to check the initialized
+  `remote_channel_command_queue` while deciding whether to use the fast
+  command-poll interval. Version `3.7.2` referenced a nonexistent attribute,
+  interrupting normal GoFree telemetry after successful subscription.
+- Added regression coverage for the idle and queued Remote Channels receive
+  paths so a command-queue name mismatch cannot block normal data collection.
+
 ## 2026-09-04 - Version 3.7.2
 
 - Forward valid GoFree Setting `31` (mast height above waterline) in each live
