@@ -1843,6 +1843,7 @@ class PiEdgeAgent:
     def health_payload(self, *, include_support_bundle: bool = True) -> dict[str, Any]:
         spool_stats = self.spool.stats()
         state_stats = disk_stats(self.state_dir)
+        network = network_snapshot()
         processor_queued = int(self.counters.get("processor_payloads_queued") or 0)
         pending = int(spool_stats.get("pending_payloads") or 0)
         upload_rate = float_or_none(self.state.get("upload_rate_payloads_per_second"))
