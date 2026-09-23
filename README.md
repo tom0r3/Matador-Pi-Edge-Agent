@@ -1,6 +1,12 @@
 # Matador
 
-Current release: `Version 3.7.6`
+Current release: `Version 3.7.7`
+
+`Version 3.7.7` restores the Pi's audited remote-maintenance path. The service
+keeps its unprivileged `matador-edge` account and narrow sudoers allow-list,
+while its systemd capability boundary now permits `sudo` to switch UID and GID
+for the permitted update, timer, reboot, and hostname commands. This resolves
+the `unable to change to root gid` self-test failure.
 
 `Version 3.7.6` restores stable Pi operation after an update and completes
 boat-speed-through-water collection for Matador target performance. The local

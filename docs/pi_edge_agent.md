@@ -1,10 +1,23 @@
 # Matador Pi Edge Agent
 
 The Matador Pi Edge Agent is the headless Raspberry Pi companion to the
-Windows Matador Edge Agent. Version 3.7.6 is the current production baseline:
+Windows Matador Edge Agent. Version 3.7.7 is the current production baseline:
 unattended operation, discovery, durable offline spooling, remote commands,
 health/storage telemetry, no-code admin claiming, golden-image preparation,
 and remote diagnostics/maintenance from Matador Admin.
+
+## Version 3.7.7 Remote Maintenance Permission Repair
+
+The Pi agent runs as the unprivileged `matador-edge` user. Its systemd unit
+keeps only the port-80 ambient capability needed by the optional Navico icon
+listener, but permits `CAP_SETUID` and `CAP_SETGID` in the capability bounding
+set. This allows the existing narrow sudoers allow-list to execute only the
+approved root-owned maintenance actions: update service start, update-timer
+control, reboot, and hostname changes.
+
+Without those two capabilities, `sudo` fails from inside the service with
+`unable to change to root gid`, so the self-test correctly reports Maintenance
+sudo as failed and remote maintenance must not be relied upon.
 
 ## Version 3.7.6 Health Recovery and Boat Speed Through Water
 
@@ -345,6 +358,11 @@ reinstalling dependencies and restarting the service. This prevents chmod drift,
 root-owned edits, or interrupted manual support changes from blocking future
 remote updates. Git safety is passed per command with `safe.directory`, so the
 systemd update service does not depend on `$HOME` or global Git config.
+
+Before relying on remote maintenance, use **Run Self-Test** in Matador Admin
+and confirm **Maintenance sudo** is green. Then use a controlled **Update Now**
+on one Pi, wait for its status to return, and verify its reported code version
+and update log before enabling automatic updates across the fleet.
 
 Admin-triggered updates start the dedicated
 `matador-pi-edge-update.service` with `systemctl --no-block` so the update runs

@@ -51,6 +51,13 @@ class PiEdgeMetadataTests(unittest.TestCase):
         agent.remote_channel_command_queue.put_nowait({"command_id": "pending"})
         self.assertTrue(agent.remote_channel_command_waiting())
 
+    def test_service_unit_allows_sudo_to_switch_identity_for_maintenance(self) -> None:
+        unit_path = Path(__file__).resolve().parents[1] / "deploy" / "matador-pi-edge-agent.service"
+        unit = unit_path.read_text(encoding="utf-8")
+
+        self.assertIn("AmbientCapabilities=CAP_NET_BIND_SERVICE", unit)
+        self.assertIn("CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_SETUID CAP_SETGID", unit)
+
     def test_combined_metadata_frame_keeps_mast_height_setting(self) -> None:
         agent = object.__new__(PiEdgeAgent)
         agent.data_info_by_metric_id = {}

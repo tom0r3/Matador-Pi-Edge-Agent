@@ -2,6 +2,16 @@
 
 All notable project changes will be recorded here.
 
+## 2026-09-23 - Version 3.7.7
+
+- Repair remote Pi maintenance under systemd. The capability bounding set now
+  permits sudo's required UID/GID transition while the agent remains an
+  unprivileged service and retains the existing narrow sudoers command list.
+- Restore reliable remote update, update-timer, reboot, and hostname actions
+  on affected Pi appliances. The self-test's **Maintenance sudo** check now
+  verifies this prerequisite before those controls should be used.
+- Add a regression check for the systemd capability boundary.
+
 ## 2026-09-23 - Version 3.7.6
 
 - Fix the Pi health-payload startup failure by capturing the network snapshot
