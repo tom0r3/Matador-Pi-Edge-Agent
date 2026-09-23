@@ -45,7 +45,7 @@ except ImportError:  # Package import during server-side tests.
 
 
 APP_NAME = "Matador Pi Edge Agent"
-DEFAULT_APP_VERSION = "3.7.7"
+DEFAULT_APP_VERSION = "3.7.8"
 DEFAULT_SERVER = "https://matador.torodatasystems.eu"
 GOFREE_DISCOVERY_GROUP = "239.2.1.1"
 GOFREE_DISCOVERY_PORTS = (2052, 2050)
@@ -1042,6 +1042,19 @@ class PiEdgeAgent:
         output = "\n".join(part.strip() for part in (result.stdout, result.stderr) if part and part.strip())
         return {"ok": result.returncode == 0, "returncode": result.returncode, "detail": output}
 
+    def maintenance_sudo_status(self) -> dict[str, Any]:
+        """Reject a nominal sudo success if its audit plugin reports a failure."""
+        status = self.command_status(["sudo", "-n", "true"], timeout=5)
+        detail = str(status.get("detail") or "")
+        if status.get("ok") and "unable to send audit message" in detail.lower():
+            return {**status, "ok": False}
+        return status
+
+    def require_maintenance_sudo(self) -> None:
+        status = self.maintenance_sudo_status()
+        if not status.get("ok"):
+            raise RuntimeError(f"Maintenance sudo is unavailable: {status.get('detail') or 'preflight failed'}")
+
     def update_timer_state(self, *, force: bool = False) -> dict[str, Any]:
         cached = self.state.get("update_timer_state")
         cached_at = float_or_none(self.state.get("update_timer_state_checked_at"))
@@ -1562,7 +1575,7 @@ class PiEdgeAgent:
             timer,
         )
 
-        sudo_check = self.command_status(["sudo", "-n", "true"], timeout=5) if os.name != "nt" else {"ok": False, "detail": "not Linux"}
+        sudo_check = self.maintenance_sudo_status() if os.name != "nt" else {"ok": False, "detail": "not Linux"}
         add("Maintenance sudo", "pass" if sudo_check.get("ok") else "fail", str(sudo_check.get("detail") or "sudo preflight ok"))
 
         network = network_snapshot()
@@ -1630,7 +1643,7 @@ class PiEdgeAgent:
             raise RuntimeError(f"Update script not found: {script}")
         self.state["last_update_requested_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         if os.name != "nt":
-            self.run_checked_command(["sudo", "-n", "true"], timeout=5)
+            self.require_maintenance_sudo()
             self.run_checked_command(["sudo", "-n", "systemctl", "--no-block", "start", "matador-pi-edge-update.service"], timeout=10)
             return
         subprocess.Popen([str(script)], cwd=str(script.parents[1]), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -1690,6 +1703,7 @@ class PiEdgeAgent:
     def set_auto_update_timer(self, enabled: bool) -> None:
         if os.name == "nt":
             raise RuntimeError("Auto-update timer control is only supported on Raspberry Pi/Linux agents")
+        self.require_maintenance_sudo()
         action = "enable" if enabled else "disable"
         command = ["sudo", "-n", "systemctl", action]
         if enabled:
@@ -1705,6 +1719,7 @@ class PiEdgeAgent:
             raise RuntimeError("Hostname must contain letters, numbers, or hyphens and be 1-63 characters")
         if os.name == "nt":
             raise RuntimeError("Hostname changes are only supported on Raspberry Pi/Linux agents")
+        self.require_maintenance_sudo()
         helper = Path(__file__).resolve().parents[1] / "scripts" / "set-hostname.sh"
         if helper.exists():
             self.run_checked_command(["sudo", "-n", str(helper), cleaned], timeout=20)
@@ -1788,6 +1803,7 @@ class PiEdgeAgent:
             elif action == "self_test":
                 self.run_self_test()
             elif action == "reboot_system":
+                self.require_maintenance_sudo()
                 acked = self.acknowledge_remote_command(requested_at)
                 self.record_command_result(action, "ok", "System reboot requested by Matador admin")
                 if acked:

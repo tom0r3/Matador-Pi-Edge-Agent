@@ -1,6 +1,11 @@
 # Matador
 
-Current release: `Version 3.7.7`
+Current release: `Version 3.7.8`
+
+`Version 3.7.8` permits sudo's audit write inside the existing systemd
+capability boundary and refuses to present an audit-plugin error as a healthy
+maintenance preflight. Remote maintenance remains disabled until the self-test
+reports a clean green **Maintenance sudo** result.
 
 `Version 3.7.7` restores the Pi's audited remote-maintenance path. The service
 keeps its unprivileged `matador-edge` account and narrow sudoers allow-list,

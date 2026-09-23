@@ -1,17 +1,26 @@
 # Matador Pi Edge Agent
 
 The Matador Pi Edge Agent is the headless Raspberry Pi companion to the
-Windows Matador Edge Agent. Version 3.7.7 is the current production baseline:
+Windows Matador Edge Agent. Version 3.7.8 is the current production baseline:
 unattended operation, discovery, durable offline spooling, remote commands,
 health/storage telemetry, no-code admin claiming, golden-image preparation,
 and remote diagnostics/maintenance from Matador Admin.
+
+## Version 3.7.8 Audit-Plugin Permission Repair
+
+Some Raspberry Pi installations enable the `sudoers_audit` plugin. It requires
+`CAP_AUDIT_WRITE` after sudo switches to root. Version `3.7.8` permits that
+capability in the systemd bounding set without granting it to the unprivileged
+agent process. The maintenance preflight now fails closed if sudo emits an
+audit-plugin error even where sudo itself returns exit status zero.
 
 ## Version 3.7.7 Remote Maintenance Permission Repair
 
 The Pi agent runs as the unprivileged `matador-edge` user. Its systemd unit
 keeps only the port-80 ambient capability needed by the optional Navico icon
 listener, but permits `CAP_SETUID` and `CAP_SETGID` in the capability bounding
-set. This allows the existing narrow sudoers allow-list to execute only the
+set, together with `CAP_AUDIT_WRITE` for sudo audit logging. This allows the
+existing narrow sudoers allow-list to execute only the
 approved root-owned maintenance actions: update service start, update-timer
 control, reboot, and hostname changes.
 

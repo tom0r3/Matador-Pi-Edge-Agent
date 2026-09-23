@@ -2,6 +2,15 @@
 
 All notable project changes will be recorded here.
 
+## 2026-09-23 - Version 3.7.8
+
+- Permit `CAP_AUDIT_WRITE` within the systemd capability boundary so enabled
+  sudo audit plugins can record approved maintenance actions.
+- Fail the Pi maintenance preflight when sudo reports an audit-plugin failure,
+  even if the command exits with status zero. Remote update, timer, reboot,
+  and hostname actions therefore fail closed until maintenance is genuinely
+  healthy.
+
 ## 2026-09-23 - Version 3.7.7
 
 - Repair remote Pi maintenance under systemd. The capability bounding set now

@@ -56,7 +56,16 @@ class PiEdgeMetadataTests(unittest.TestCase):
         unit = unit_path.read_text(encoding="utf-8")
 
         self.assertIn("AmbientCapabilities=CAP_NET_BIND_SERVICE", unit)
-        self.assertIn("CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_SETUID CAP_SETGID", unit)
+        self.assertIn("CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_SETUID CAP_SETGID CAP_AUDIT_WRITE", unit)
+
+    def test_maintenance_sudo_rejects_an_audit_plugin_error(self) -> None:
+        agent = object.__new__(PiEdgeAgent)
+        agent.command_status = lambda *_args, **_kwargs: {
+            "ok": True,
+            "detail": "sudo: unable to send audit message: Operation not permitted",
+        }
+
+        self.assertFalse(agent.maintenance_sudo_status()["ok"])
 
     def test_combined_metadata_frame_keeps_mast_height_setting(self) -> None:
         agent = object.__new__(PiEdgeAgent)
