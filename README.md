@@ -1,6 +1,15 @@
 # Matador
 
-Current release: `Version 3.7.3`
+Current release: `Version 3.7.6`
+
+`Version 3.7.6` restores stable Pi operation after an update and completes
+boat-speed-through-water collection for Matador target performance. The local
+health payload now captures its network snapshot before rendering, preventing
+the startup exception that interrupted configuration polling, upstream
+streaming, and the port `8080` status page. When Matador requests canonical
+`BOAT_SPEED_WATER`, the Pi subscribes to B&G GoFree DataInfo `42` and forwards
+the reading with its native source ID for diagnostics. This is BSP/STW, not
+GPS SOG.
 
 `Version 3.7.3` restores normal Pi GoFree telemetry after the `3.7.2` release.
 It corrects the Remote Channels command-queue reference used by the receive

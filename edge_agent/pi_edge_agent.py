@@ -45,7 +45,7 @@ except ImportError:  # Package import during server-side tests.
 
 
 APP_NAME = "Matador Pi Edge Agent"
-DEFAULT_APP_VERSION = "3.7.5"
+DEFAULT_APP_VERSION = "3.7.6"
 DEFAULT_SERVER = "https://matador.torodatasystems.eu"
 GOFREE_DISCOVERY_GROUP = "239.2.1.1"
 GOFREE_DISCOVERY_PORTS = (2052, 2050)
@@ -1994,6 +1994,13 @@ class PiEdgeAgent:
                 await self.send_remote_channel_plan(websocket, plan)
         self.set_remote_channel_ack(self.remote_channel_executor.check_timeout())
 
+    def remote_channel_command_waiting(self) -> bool:
+        """Use the faster processor receive cycle only while work is pending."""
+        return (
+            self.remote_channel_executor.active_command is not None
+            or not self.remote_channel_command_queue.empty()
+        )
+
     def locked_processor_identity(self) -> dict[str, Any] | None:
         config_lock = self.config().get("processor_lock")
         if isinstance(config_lock, dict) and config_lock:
@@ -2358,10 +2365,7 @@ class PiEdgeAgent:
                     await self.request_metadata(websocket)
                     last_metadata_request = time.monotonic()
                 try:
-                    command_waiting = (
-                        self.remote_channel_executor.active_command is not None
-                        or not self.remote_channel_command_queue.empty()
-                    )
+                    command_waiting = self.remote_channel_command_waiting()
                     message = await asyncio.wait_for(
                         websocket.recv(),
                         timeout=0.2 if command_waiting else 1.0,

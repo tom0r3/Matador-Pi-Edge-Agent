@@ -1,10 +1,23 @@
 # Matador Pi Edge Agent
 
 The Matador Pi Edge Agent is the headless Raspberry Pi companion to the
-Windows Matador Edge Agent. Version 3.7.3 is the current production baseline:
+Windows Matador Edge Agent. Version 3.7.6 is the current production baseline:
 unattended operation, discovery, durable offline spooling, remote commands,
 health/storage telemetry, no-code admin claiming, golden-image preparation,
 and remote diagnostics/maintenance from Matador Admin.
+
+## Version 3.7.6 Health Recovery and Boat Speed Through Water
+
+Version `3.7.6` initializes the network snapshot before constructing the local
+health payload. This prevents a startup `NameError` which could interrupt
+Matador configuration polling, upstream streaming, and the local status page.
+
+When the Matador server requests canonical `BOAT_SPEED_WATER`, the Pi now
+subscribes to B&G GoFree DataInfo `42`, preserves that source ID as
+`gofree_data_id` for diagnostics, and uploads the value as canonical boat speed
+through water. This is BSP/STW and is distinct from GPS SOG. The source GoFree
+ID remains server-configured, allowing future supported mappings without a Pi
+software change.
 
 ## Version 3.7.3 GoFree Receive Recovery
 

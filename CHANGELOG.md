@@ -2,6 +2,18 @@
 
 All notable project changes will be recorded here.
 
+## 2026-09-23 - Version 3.7.6
+
+- Fix the Pi health-payload startup failure by capturing the network snapshot
+  before it is included in the returned status. This restores normal config
+  polling, Matador streaming, and the local port `8080` health page after an
+  agent restart.
+- Support server-configured canonical boat speed through water. When Matador
+  requests `BOAT_SPEED_WATER`, the Pi subscribes to B&G GoFree DataInfo `42`,
+  preserves `gofree_data_id` for diagnostics, and uploads BSP/STW rather than
+  confusing it with GPS SOG.
+- Add regression coverage for the health payload and canonical BSP mapping.
+
 ## 2026-09-04 - Version 3.7.3
 
 - Fixed the Pi GoFree receive loop to check the initialized
