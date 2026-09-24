@@ -1,6 +1,12 @@
 # Matador
 
-Current release: `Version 3.7.9`
+Current release: `Version 3.7.10`
+
+`Version 3.7.10` retains the most recent complete port `8080` status snapshot
+if a later probe fails and includes a final self-contained fallback page if
+HTML rendering itself fails. The status page therefore keeps retrying rather
+than returning the bare `Local status error`; the full cause is recorded in
+the Pi service journal.
 
 `Version 3.7.9` keeps the local port `8080` diagnostics available when an
 optional status probe fails. It displays a **Limited local status** explanation

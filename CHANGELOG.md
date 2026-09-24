@@ -2,6 +2,16 @@
 
 All notable project changes will be recorded here.
 
+## 2026-09-24 - Version 3.7.10
+
+- Retain the most recent complete port `8080` local-status snapshot when a
+  later diagnostic probe fails, keeping useful health and connectivity detail
+  visible during a transient failure.
+- Add a self-contained final local-status page for a rendering failure. The
+  five-second refresh can no longer degrade into the bare `Local status error`
+  response, and the service log now records the full traceback for diagnosis.
+- Add regression coverage for the final fallback page.
+
 ## 2026-09-24 - Version 3.7.9
 
 - Keep the local port `8080` diagnostics available when an optional snapshot

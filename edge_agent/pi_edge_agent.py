@@ -45,7 +45,7 @@ except ImportError:  # Package import during server-side tests.
 
 
 APP_NAME = "Matador Pi Edge Agent"
-DEFAULT_APP_VERSION = "3.7.9"
+DEFAULT_APP_VERSION = "3.7.10"
 DEFAULT_SERVER = "https://matador.torodatasystems.eu"
 GOFREE_DISCOVERY_GROUP = "239.2.1.1"
 GOFREE_DISCOVERY_PORTS = (2052, 2050)
@@ -767,6 +767,7 @@ class PiEdgeAgent:
             "error": None,
         }
         self.latest_values_by_metric: dict[str, dict[str, Any]] = {}
+        self.last_local_status_snapshot: dict[str, Any] | None = None
         self.live_payload_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=100)
         self.remote_channel_command_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=1)
         self.remote_channel_executor = RemoteChannelCommandExecutor()
@@ -1288,6 +1289,23 @@ class PiEdgeAgent:
     def local_status_error_snapshot(self, error: Exception) -> dict[str, Any]:
         """Keep local diagnostics available if an optional status probe fails."""
         detail = f"{type(error).__name__}: {error}".strip()
+        previous = getattr(self, "last_local_status_snapshot", None)
+        if isinstance(previous, dict):
+            # Preserve a complete, previously rendered snapshot while making
+            # the current failure visible instead of replacing the page.
+            snapshot = dict(previous)
+            snapshot["generated_at"] = utc_timestamp()
+            snapshot["local_status_error"] = detail or type(error).__name__
+            connectivity = dict(snapshot.get("connectivity") or {})
+            connectivity.update(
+                {
+                    "config": getattr(self, "config_status", connectivity.get("config", "unavailable")),
+                    "processor": getattr(self, "processor_connection_status", connectivity.get("processor", "unavailable")),
+                    "upstream": getattr(self, "upstream_connection_status", connectivity.get("upstream", "unavailable")),
+                }
+            )
+            snapshot["connectivity"] = connectivity
+            return snapshot
         return {
             "generated_at": utc_timestamp(),
             "local_status_error": detail or type(error).__name__,
@@ -1503,6 +1521,33 @@ class PiEdgeAgent:
 </body>
 </html>"""
 
+    def render_local_status_error_html(self, error: Exception) -> str:
+        """Render a final status page without depending on agent health data."""
+        detail = html.escape(f"{type(error).__name__}: {error}".strip())
+        return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="refresh" content="5">
+  <title>Matador Pi Edge Health</title>
+  <style>
+    :root {{ color-scheme: dark; --bg: #071018; --panel: #101a26; --border: #2d4054; --text: #eef6ff; --muted: #9db1c5; --warn: #fbbf24; }}
+    * {{ box-sizing: border-box; }}
+    body {{ margin: 0; font-family: ui-sans-serif, system-ui, sans-serif; background: radial-gradient(circle at top left, #143044, var(--bg) 42rem); color: var(--text); }}
+    main {{ width: min(760px, calc(100% - 28px)); margin: 56px auto; padding: 24px; background: var(--panel); border: 1px solid var(--border); border-radius: 18px; }}
+    h1 {{ margin: 0 0 12px; }} p, code {{ color: var(--muted); }} .warning {{ padding: 14px; border: 1px solid rgba(251,191,36,.7); border-radius: 12px; color: var(--warn); background: rgba(134,82,4,.18); }}
+  </style>
+</head>
+<body><main>
+  <h1>Limited local status</h1>
+  <div class="warning"><strong>The full status page could not be rendered.</strong><br>{detail}</div>
+  <p>The Pi Edge Agent remains available. This page retries automatically every five seconds.</p>
+  <p>Inspect the service log if this persists:</p>
+  <code>sudo journalctl -u matador-pi-edge-agent.service -n 100 --no-pager</code>
+</main></body>
+</html>"""
+
     async def write_local_status_response(self, writer: asyncio.StreamWriter, status: str, content_type: str, body: str) -> None:
         encoded = body.encode("utf-8")
         writer.write(
@@ -1534,8 +1579,9 @@ class PiEdgeAgent:
                 return
             try:
                 snapshot = self.local_status_snapshot()
+                self.last_local_status_snapshot = snapshot
             except Exception as exc:
-                LOGGER.warning("Local status snapshot is incomplete: %s", exc)
+                LOGGER.exception("Local status snapshot is incomplete")
                 snapshot = self.local_status_error_snapshot(exc)
             if path in {"/api/status", "/status.json"}:
                 await self.write_local_status_response(writer, "200 OK", "application/json", json.dumps(snapshot, indent=2, sort_keys=True, default=str))
@@ -1544,11 +1590,17 @@ class PiEdgeAgent:
                 body = json.dumps({"ok": not is_degraded, "agent": snapshot.get("agent"), "connectivity": snapshot.get("connectivity"), "error": snapshot.get("local_status_error")}, indent=2, sort_keys=True)
                 await self.write_local_status_response(writer, "503 Service Unavailable" if is_degraded else "200 OK", "application/json", body)
             elif path in {"/", "/index.html"}:
-                await self.write_local_status_response(writer, "200 OK", "text/html", self.render_local_status_html(snapshot))
+                try:
+                    body = self.render_local_status_html(snapshot)
+                except Exception as exc:
+                    LOGGER.exception("Local status page rendering failed")
+                    body = self.render_local_status_error_html(exc)
+                await self.write_local_status_response(writer, "200 OK", "text/html", body)
         except Exception as exc:
-            LOGGER.debug("Local status request failed: %s", exc)
+            LOGGER.exception("Local status request failed")
             with suppress(Exception):
-                await self.write_local_status_response(writer, "500 Internal Server Error", "text/plain", "Local status error")
+                writer.close()
+                await writer.wait_closed()
 
     async def local_status_loop(self) -> None:
         if self.local_status_port <= 0:

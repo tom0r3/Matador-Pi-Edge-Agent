@@ -55,6 +55,15 @@ class PiEdgeMetadataTests(unittest.TestCase):
         self.assertIn("RuntimeError: network diagnostic unavailable", page)
         self.assertIn("connected 192.168.50.31:2053", page)
 
+    def test_last_resort_local_status_page_never_requires_health_data(self) -> None:
+        agent = object.__new__(PiEdgeAgent)
+
+        page = agent.render_local_status_error_html(RuntimeError("template rendering unavailable"))
+
+        self.assertIn("Limited local status", page)
+        self.assertIn("RuntimeError: template rendering unavailable", page)
+        self.assertIn("journalctl -u matador-pi-edge-agent.service", page)
+
     def test_idle_remote_channel_receive_uses_initialized_queue(self) -> None:
         agent = object.__new__(PiEdgeAgent)
         agent.remote_channel_executor = SimpleNamespace(active_command=None)
