@@ -45,7 +45,7 @@ except ImportError:  # Package import during server-side tests.
 
 
 APP_NAME = "Matador Pi Edge Agent"
-DEFAULT_APP_VERSION = "3.7.8"
+DEFAULT_APP_VERSION = "3.7.9"
 DEFAULT_SERVER = "https://matador.torodatasystems.eu"
 GOFREE_DISCOVERY_GROUP = "239.2.1.1"
 GOFREE_DISCOVERY_PORTS = (2052, 2050)
@@ -1285,6 +1285,30 @@ class PiEdgeAgent:
             "live_queue_size": self.live_payload_queue.qsize(),
         }
 
+    def local_status_error_snapshot(self, error: Exception) -> dict[str, Any]:
+        """Keep local diagnostics available if an optional status probe fails."""
+        detail = f"{type(error).__name__}: {error}".strip()
+        return {
+            "generated_at": utc_timestamp(),
+            "local_status_error": detail or type(error).__name__,
+            "agent": {
+                "kind": "pi_edge_agent",
+                "name": APP_NAME,
+                "version": APP_VERSION,
+                "hostname": hostname(),
+            },
+            "connectivity": {
+                "config": getattr(self, "config_status", "unavailable"),
+                "processor": getattr(self, "processor_connection_status", "unavailable"),
+                "upstream": getattr(self, "upstream_connection_status", "unavailable"),
+            },
+            "health": {},
+            "subscribed_metrics": [],
+            "subscribed_metric_count": 0,
+            "latest_value_count": 0,
+            "live_queue_size": 0,
+        }
+
     def local_status_pill_class(self, value: Any) -> str:
         text = str(value or "").lower()
         if any(token in text for token in ("error", "failed", "reconnecting", "interrupted", "critical", "rejected")):
@@ -1310,6 +1334,7 @@ class PiEdgeAgent:
         wifi = network.get("wifi") if isinstance(network.get("wifi"), dict) else {}
         lock = health.get("locked_processor_identity") or {}
         connectivity = snapshot.get("connectivity") or {}
+        status_error = snapshot.get("local_status_error")
 
         def pill(label: str, value: Any) -> str:
             css = self.local_status_pill_class(value)
@@ -1369,6 +1394,7 @@ class PiEdgeAgent:
     h1 {{ margin: 0; font-size: clamp(1.6rem, 3vw, 2.3rem); letter-spacing: -0.03em; }}
     h2 {{ margin: 0 0 12px; font-size: 0.9rem; text-transform: uppercase; letter-spacing: 0.12em; color: var(--muted); }}
     .sub {{ color: var(--muted); margin-top: 5px; }}
+    .status-error {{ margin-bottom: 16px; padding: 12px 14px; border: 1px solid rgba(251,191,36,.7); border-radius: 12px; color: var(--warn); background: rgba(134,82,4,.18); }}
     .grid {{ display: grid; grid-template-columns: repeat(12, 1fr); gap: 14px; }}
     .card {{ grid-column: span 4; background: linear-gradient(180deg, rgba(22,35,50,.94), rgba(10,18,28,.94)); border: 1px solid var(--border); border-radius: 18px; padding: 16px; box-shadow: 0 18px 50px rgba(0,0,0,.25); }}
     .card.wide {{ grid-column: span 8; }}
@@ -1396,6 +1422,7 @@ class PiEdgeAgent:
 </head>
 <body>
 <main>
+  {f'<div class="status-error"><strong>Limited local status</strong><br>{esc(status_error)}</div>' if status_error else ''}
   <header>
     <div>
       <h1>{esc(agent.get("hostname") or hostname())}</h1>
@@ -1502,16 +1529,22 @@ class PiEdgeAgent:
             if method.upper() != "GET":
                 await self.write_local_status_response(writer, "405 Method Not Allowed", "text/plain", "Method not allowed")
                 return
-            snapshot = self.local_status_snapshot()
+            if path not in {"/", "/index.html", "/api/status", "/status.json", "/health"}:
+                await self.write_local_status_response(writer, "404 Not Found", "text/plain", "Not found")
+                return
+            try:
+                snapshot = self.local_status_snapshot()
+            except Exception as exc:
+                LOGGER.warning("Local status snapshot is incomplete: %s", exc)
+                snapshot = self.local_status_error_snapshot(exc)
             if path in {"/api/status", "/status.json"}:
                 await self.write_local_status_response(writer, "200 OK", "application/json", json.dumps(snapshot, indent=2, sort_keys=True, default=str))
             elif path == "/health":
-                body = json.dumps({"ok": True, "agent": snapshot.get("agent"), "connectivity": snapshot.get("connectivity")}, indent=2, sort_keys=True)
-                await self.write_local_status_response(writer, "200 OK", "application/json", body)
+                is_degraded = bool(snapshot.get("local_status_error"))
+                body = json.dumps({"ok": not is_degraded, "agent": snapshot.get("agent"), "connectivity": snapshot.get("connectivity"), "error": snapshot.get("local_status_error")}, indent=2, sort_keys=True)
+                await self.write_local_status_response(writer, "503 Service Unavailable" if is_degraded else "200 OK", "application/json", body)
             elif path in {"/", "/index.html"}:
                 await self.write_local_status_response(writer, "200 OK", "text/html", self.render_local_status_html(snapshot))
-            else:
-                await self.write_local_status_response(writer, "404 Not Found", "text/plain", "Not found")
         except Exception as exc:
             LOGGER.debug("Local status request failed: %s", exc)
             with suppress(Exception):

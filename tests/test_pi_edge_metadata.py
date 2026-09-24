@@ -42,6 +42,19 @@ class PiEdgeMetadataTests(unittest.TestCase):
 
         self.assertEqual(payload["network"], {"interfaces": ["eth0"]})
 
+    def test_local_status_fallback_keeps_the_html_page_available(self) -> None:
+        agent = object.__new__(PiEdgeAgent)
+        agent.config_status = "ok"
+        agent.processor_connection_status = "connected 192.168.50.31:2053"
+        agent.upstream_connection_status = "connected"
+
+        snapshot = agent.local_status_error_snapshot(RuntimeError("network diagnostic unavailable"))
+        page = agent.render_local_status_html(snapshot)
+
+        self.assertIn("Limited local status", page)
+        self.assertIn("RuntimeError: network diagnostic unavailable", page)
+        self.assertIn("connected 192.168.50.31:2053", page)
+
     def test_idle_remote_channel_receive_uses_initialized_queue(self) -> None:
         agent = object.__new__(PiEdgeAgent)
         agent.remote_channel_executor = SimpleNamespace(active_command=None)

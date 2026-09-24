@@ -1,10 +1,18 @@
 # Matador Pi Edge Agent
 
 The Matador Pi Edge Agent is the headless Raspberry Pi companion to the
-Windows Matador Edge Agent. Version 3.7.8 is the current production baseline:
+Windows Matador Edge Agent. Version 3.7.9 is the current production baseline:
 unattended operation, discovery, durable offline spooling, remote commands,
 health/storage telemetry, no-code admin claiming, golden-image preparation,
 and remote diagnostics/maintenance from Matador Admin.
+
+## Version 3.7.9 Local Status Resilience
+
+If an optional local diagnostic fails while building the port `8080` snapshot,
+the status page remains available and displays **Limited local status** with
+the error. `/api/status` returns the degraded snapshot, and `/health` returns
+HTTP `503` until a full snapshot can be collected. This avoids a generic
+`Local status error` page while preserving a correct monitoring signal.
 
 ## Version 3.7.8 Audit-Plugin Permission Repair
 
@@ -272,7 +280,8 @@ Useful local status endpoints:
 
 - `/` shows the human-readable status page.
 - `/api/status` returns the same operational snapshot as JSON.
-- `/health` returns a compact JSON health response.
+- `/health` returns a compact JSON health response, or HTTP `503` with the
+  diagnostic error when the local snapshot is incomplete.
 
 If the page shows a local status error, inspect the traceback with:
 

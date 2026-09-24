@@ -1,6 +1,10 @@
 # Matador
 
-Current release: `Version 3.7.8`
+Current release: `Version 3.7.9`
+
+`Version 3.7.9` keeps the local port `8080` diagnostics available when an
+optional status probe fails. It displays a **Limited local status** explanation
+and makes `/health` return HTTP `503` until a complete snapshot is available.
 
 `Version 3.7.8` permits sudo's audit write inside the existing systemd
 capability boundary and refuses to present an audit-plugin error as a healthy
@@ -96,7 +100,8 @@ default. It shows Matador/GoFree connectivity, queue state, Pi network/storage
 health, processor lock, discovered processors, and latest subscribed metric
 values. `/api/status` returns the same snapshot as JSON and `/health` returns a
 compact health response. If a live diagnostic section cannot be read, the page
-stays available and shows a warning instead of failing completely. Set
+stays available with a **Limited local status** explanation, while `/health`
+returns HTTP `503` instead of a false healthy result. Set
 `MATADOR_PI_EDGE_LOCAL_STATUS_PORT=0` to disable the local page on installations
 where it is not wanted. Browser refresh/preload disconnects and speculative
 connections that send no request are ignored, and any genuine local-page

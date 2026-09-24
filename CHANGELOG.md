@@ -2,6 +2,15 @@
 
 All notable project changes will be recorded here.
 
+## 2026-09-24 - Version 3.7.9
+
+- Keep the local port `8080` diagnostics available when an optional snapshot
+  probe fails. The page now displays **Limited local status** with the local
+  error instead of returning only `Local status error`.
+- Mark `/health` as degraded with HTTP `503` when its snapshot is incomplete,
+  so monitoring cannot treat a partial status response as healthy.
+- Add regression coverage for the degraded status-page rendering path.
+
 ## 2026-09-23 - Version 3.7.8
 
 - Permit `CAP_AUDIT_WRITE` within the systemd capability boundary so enabled
